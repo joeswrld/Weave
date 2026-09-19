@@ -11,5 +11,9 @@ export * from "./merkle";
 export * from "./block";
 export * from "./script";
 
+// Phase 3 — UTXO set & validation
+export * from "./utxo";
+export * from "./chain";
+
 // Phase 4 — Mining
 export * from "./difficulty";
