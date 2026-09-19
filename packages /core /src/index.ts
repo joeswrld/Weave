@@ -17,3 +17,7 @@ export * from "./chain";
 
 // Phase 4 — Mining
 export * from "./difficulty";
+
+// Phase 5 — P2P wire protocol (message types + codec).
+export * from "./messages";
+export * from "./codec";
