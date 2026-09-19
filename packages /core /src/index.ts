@@ -10,3 +10,6 @@ export * from "./transaction";
 export * from "./merkle";
 export * from "./block";
 export * from "./script";
+
+// Phase 4 — Mining
+export * from "./difficulty";
