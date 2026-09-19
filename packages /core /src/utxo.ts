@@ -3,15 +3,15 @@
  * ...
  */
 
-import { getBlockHash, type Block, type BlockHeader } from "./block";
+import { checkBlockStructure, getBlockHash, type Block, type BlockHeader } from "./block";
 import { getBlockRewardSmallestUnits } from "./consensus-params";
 import { hashesEqual, hashToHex, type Hash } from "./hash";
-import { checkScriptsStructure, parseLockingScript } from "./script";
+import { checkScriptsStructure } from "./script";
 import { compactToTarget, hashMeetsTarget } from "./target";
 import {
   checkTransactionStructure,
+  getCoinbaseHeight,
   getTxId,
-  getTxIdHex,
   isCoinbase,
   outpointKey,
   type Transaction,
@@ -46,6 +46,97 @@ export class UtxoSet {
 }
 
 export const COINBASE_MATURITY_BLOCKS = 100;
+
+/**
+ * Blocks whose timestamp is more than this far ahead of node-local time are
+ * rejected outright — same 2-hour tolerance Bitcoin uses, wide enough to
+ * absorb ordinary clock skew across a decentralized set of peers without
+ * letting a block claim to be from far in the future.
+ */
+export const MAX_FUTURE_BLOCK_TIME_SECONDS = 2 * 60 * 60;
+
+/** How many of the immediately preceding blocks' timestamps feed median-time-past. */
+export const MEDIAN_TIME_PAST_WINDOW = 11;
+
+// ---------------------------------------------------------------------------
+// Transaction validation result
+// ---------------------------------------------------------------------------
+
+export type TransactionValidationResult =
+  | { valid: true; totalInput: bigint; totalOutput: bigint; fee: bigint }
+  | { valid: false; reason: string };
+
+function invalid(reason: string): TransactionValidationResult {
+  return { valid: false, reason };
+}
+
+// ---------------------------------------------------------------------------
+// Block validation result and context
+// ---------------------------------------------------------------------------
+
+export type BlockValidationResult =
+  | { valid: true; totalFees: bigint }
+  | { valid: false; reason: string };
+
+function invalidBlock(reason: string): BlockValidationResult {
+  return { valid: false, reason };
+}
+
+/**
+ * Everything about the chain-so-far that block validation needs but that a
+ * bare Block/UtxoSet pair can't supply on its own. Assembled by the caller
+ * (chain.ts) from its own block index — utxo.ts stays chain-state-free.
+ */
+export interface BlockContext {
+  /** Height this block would occupy if accepted (genesis = 0). */
+  height: number;
+  /** Hash of the block this one must build on (zero hash only at genesis). */
+  expectedPrevHash: Hash;
+  /**
+   * Timestamps of up to the last MEDIAN_TIME_PAST_WINDOW blocks, ordered
+   * oldest-first, ending with the current tip. Empty only at genesis.
+   */
+  prevTimestamps: number[];
+  /** Overrides Date.now()-derived "now" for deterministic tests. */
+  now?: number;
+}
+
+/** Median of the last MEDIAN_TIME_PAST_WINDOW timestamps (Bitcoin's median-time-past rule). */
+export function medianTimePast(prevTimestamps: number[]): number {
+  const window = prevTimestamps.slice(-MEDIAN_TIME_PAST_WINDOW);
+  const sorted = [...window].sort((a, b) => a - b);
+  return sorted[Math.floor((sorted.length - 1) / 2)]!;
+}
+
+/** Sum of a coinbase transaction's output values. */
+export function coinbaseOutputTotal(coinbaseTx: Transaction): bigint {
+  let total = 0n;
+  for (const output of coinbaseTx.outputs) total += output.value;
+  return total;
+}
+
+/**
+ * Structural checks that DO need chain context (unlike
+ * checkBlockStructure in block.ts, which is context-free): the block must
+ * actually build on the expected tip, and must have a coinbase whose
+ * embedded height (script.ts's height-in-coinbase convention) matches the
+ * height it's being validated at.
+ */
+function checkBlockStructureAgainstContext(block: Block, context: BlockContext): string | null {
+  const genericProblem = checkBlockStructure(block);
+  if (genericProblem) return genericProblem;
+
+  if (!hashesEqual(block.header.prevHash, context.expectedPrevHash)) {
+    return `block does not build on the expected tip (got prevHash ${hashToHex(block.header.prevHash)})`;
+  }
+
+  const coinbaseHeight = getCoinbaseHeight(block.transactions[0]!);
+  if (coinbaseHeight === null || coinbaseHeight !== context.height) {
+    return `coinbase height ${String(coinbaseHeight)} does not match block height ${context.height}`;
+  }
+
+  return null;
+}
 
 export function validateTransaction(
   tx: Transaction,
