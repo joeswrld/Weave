@@ -1,23 +1,17 @@
 {
-  "name": "@weave/crypto",
+  "name": "weave",
   "version": "0.0.1",
   "private": true,
+  "description": "Weave (WVE) — a web-native TypeScript blockchain.",
   "type": "module",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "test": "vitest run",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
-  },
-  "dependencies": {
-    "@weave/core": "workspace:*",
-    "@noble/curves": "^1.6.0",
-    "@noble/hashes": "^1.5.0",
-    "@scure/base": "^1.1.9"
+    "build": "pnpm -r run build",
+    "test": "pnpm -r run test",
+    "typecheck": "pnpm -r run typecheck"
   },
   "devDependencies": {
     "typescript": "^5.5.4",
     "vitest": "^2.0.5"
-  }
+  },
+  "packageManager": "pnpm@9.7.0"
 }
