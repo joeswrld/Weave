@@ -12,6 +12,7 @@
  */
 
 import { sha256 } from "@noble/hashes/sha256";
+import { ripemd160 } from "@noble/hashes/ripemd160";
 import { bytesToHex, hexToBytes } from "@noble/hashes/utils";
 
 export const HASH_LENGTH = 32;
@@ -50,4 +51,17 @@ export function hashesEqual(a: Uint8Array, b: Uint8Array): boolean {
 
 export function isZeroHash(hash: Uint8Array): boolean {
   return hash.length === HASH_LENGTH && hash.every((b) => b === 0);
+}
+
+/**
+ * HASH160, Bitcoin's standard two-step public-key hash: RIPEMD160(SHA256(data)).
+ * Lives in core (rather than @weave/crypto) because both `script.ts` here
+ * (matching a P2PKH locking script's pubKeyHash) and @weave/crypto's
+ * address.ts (deriving an address from a pubkey) need to compute exactly
+ * the same 20-byte value — defining it once here is what keeps them from
+ * silently drifting apart. @weave/crypto re-exports this rather than
+ * reimplementing it.
+ */
+export function hash160(data: Uint8Array): Uint8Array {
+  return ripemd160(sha256(data));
 }
