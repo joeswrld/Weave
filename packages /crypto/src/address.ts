@@ -15,8 +15,8 @@
  */
 
 import { sha256 } from "@noble/hashes/sha256";
-import { ripemd160 } from "@noble/hashes/ripemd160";
 import { base58 } from "@scure/base";
+import { hash160 } from "@weave/core";
 
 /**
  * Weave's address version byte. Chosen arbitrarily distinct from Bitcoin
@@ -27,15 +27,11 @@ import { base58 } from "@scure/base";
  */
 export const ADDRESS_VERSION_BYTE = 0x2d; // arbitrary, Weave-specific
 
-/**
- * HASH160, Bitcoin's standard two-step public-key hash:
- * RIPEMD160(SHA256(data)). Used here for pubkey → pubkeyHash, but kept as
- * a general helper since script.ts (P2PKH-equivalent locking script) also
- * needs to compute/compare this same hash.
- */
-export function hash160(data: Uint8Array): Uint8Array {
-  return ripemd160(sha256(data));
-}
+// hash160 (RIPEMD160(SHA256(data))) lives in @weave/core — both this module
+// and core's script.ts (P2PKH locking-script matching) need the exact same
+// 20-byte value, so it's defined once there. Re-exported here so existing
+// callers of `import { hash160 } from "@weave/crypto"` keep working.
+export { hash160 };
 
 /**
  * Derives a base58check Weave address from a compressed secp256k1 public
