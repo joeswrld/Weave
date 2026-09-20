@@ -1,0 +1,11 @@
+{
+  "name": "@weave/wallet",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "echo wallet not built yet",
+    "test": "echo no tests",
+    "typecheck": "echo skip"
+  }
+}
