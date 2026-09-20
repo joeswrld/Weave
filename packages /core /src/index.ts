@@ -18,6 +18,7 @@ export * from "./chain";
 // Phase 4 — Mining
 export * from "./difficulty";
 
-// Phase 5 — P2P wire protocol (message types + codec).
-export * from "./messages";
-export * from "./codec";
+// Phase 5 — P2P wire protocol (message types + codec) lives in the
+// separate @weave/protocol package, not here: core has no business
+// knowing about wire framing, and node/wallet both already depend on
+// @weave/protocol directly for that.
