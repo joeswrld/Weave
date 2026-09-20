@@ -47,6 +47,8 @@ export interface PeerManagerOptions {
   onPeerMisbehavior?: (peer: Peer, reason: string) => void;
   /** Injectable for tests; defaults to the real `ws` WebSocket constructor. */
   connect?: (address: string) => WebSocket;
+  /** Trust the `X-Forwarded-For` header for inbound peers' IPs. Enable ONLY behind a reverse proxy you control. */
+  trustProxy?: boolean;
 }
 
 /**
@@ -59,7 +61,7 @@ function normalizeAddress(address: string): string {
 
 export class PeerManager {
   private readonly local: LocalNodeInfo;
-  private readonly options: Required<Pick<PeerManagerOptions, "minOutboundPeers" | "maxInboundPeers" | "maxTotalPeers">>;
+  private readonly options: Required<Pick<PeerManagerOptions, "minOutboundPeers" | "maxInboundPeers" | "maxTotalPeers" | "trustProxy">>;
   private readonly seedAddresses: string[];
   private readonly connectFn: (address: string) => WebSocket;
 
@@ -87,6 +89,7 @@ export class PeerManager {
       minOutboundPeers: options.minOutboundPeers ?? MIN_OUTBOUND_PEERS,
       maxInboundPeers: options.maxInboundPeers ?? MAX_INBOUND_PEERS,
       maxTotalPeers: options.maxTotalPeers ?? MAX_TOTAL_PEERS,
+      trustProxy: options.trustProxy ?? false,
     };
     this.onPeerReady = options.onPeerReady;
     this.onPeerMessage = options.onPeerMessage;
@@ -95,55 +98,90 @@ export class PeerManager {
     this.connectFn = options.connect ?? ((address: string) => new WebSocket(address));
   }
 
-  // -- Inbound: accept connections on an existing HTTP(S) server -----------
+  // -- Inbound ---------------------------------------------------------------
 
   /**
-   * Attaches an inbound WebSocket listener to an already-listening HTTP or
-   * HTTPS server (the node's REST API server — see main.ts). Sharing one
-   * server/port for REST + P2P keeps a single TLS termination point, which
-   * is what "WSS (TLS), not plaintext WS" (Phase 5's last requirement)
-   * actually needs in practice: terminate TLS once, at the HTTPS server,
-   * and everything riding on it (REST, wallet WS feed, P2P WS) inherits it.
+   * Shared inbound accept path: enforces peer caps, resolves the remote IP
+   * (honouring X-Forwarded-For only when `trustProxy` is set — otherwise a
+   * client could spoof it), and registers the peer. Used by all three
+   * attach modes below so they can't drift apart.
    */
-  attachToServer(server: HttpServer | HttpsServer, path = "/p2p"): void {
-    this.wss = new WebSocketServer({ server, path });
-    this.wss.on("connection", (socket: WebSocket, req: IncomingMessage) => {
-      if (this.peerCountByDirection("inbound") >= this.options.maxInboundPeers || this.peers.size >= this.options.maxTotalPeers) {
+  private wireInbound(wss: WebSocketServer): void {
+    if (this.wss) throw new Error("PeerManager inbound server already configured");
+    this.wss = wss;
+    wss.on("connection", (socket: WebSocket, req: IncomingMessage) => {
+      if (
+        this.closed ||
+        this.peerCountByDirection("inbound") >= this.options.maxInboundPeers ||
+        this.peers.size >= this.options.maxTotalPeers
+      ) {
         socket.close(1013, "too many peers");
         return;
       }
-      const remoteAddress = req.socket.remoteAddress ?? "unknown";
-      this.registerPeer(socket, "inbound", remoteAddress);
+      this.registerPeer(socket, "inbound", this.resolveRemoteAddress(req));
     });
+  }
+
+  private resolveRemoteAddress(req: IncomingMessage): string {
+    if (this.options.trustProxy) {
+      const fwd = req.headers["x-forwarded-for"];
+      const first = (Array.isArray(fwd) ? fwd[0] : fwd)?.split(",")[0]?.trim();
+      if (first) return first;
+    }
+    return req.socket.remoteAddress ?? "unknown";
+  }
+
+  /**
+   * Attaches an inbound WebSocket listener directly to an HTTP(S) server.
+   * Only suitable when P2P is the ONLY websocket endpoint on that server —
+   * `ws` aborts upgrades for non-matching paths, which would break any
+   * other WebSocketServer on the same server. If the node also serves a
+   * wallet feed on the same port (see main.ts), use `createInboundServer()`
+   * and route upgrades yourself instead.
+   */
+  attachToServer(server: HttpServer | HttpsServer, path = "/p2p"): void {
+    this.wireInbound(new WebSocketServer({ server, path }));
+  }
+
+  /**
+   * Creates the inbound WebSocketServer in `noServer` mode and returns it;
+   * the caller routes HTTP `upgrade` events to it (via `handleUpgrade`).
+   * This is what lets `/p2p` and the wallet `/ws` feed share one port and
+   * one TLS termination point.
+   */
+  createInboundServer(): WebSocketServer {
+    const wss = new WebSocketServer({ noServer: true });
+    this.wireInbound(wss);
+    return wss;
   }
 
   /** Standalone listener, for a node that isn't already running an HTTP server (e.g. a pure P2P-only process, or tests). */
   listenStandalone(port: number, host = "0.0.0.0"): void {
-    this.wss = new WebSocketServer({ port, host, path: "/p2p" });
-    this.wss.on("connection", (socket: WebSocket, req: IncomingMessage) => {
-      if (this.peerCountByDirection("inbound") >= this.options.maxInboundPeers || this.peers.size >= this.options.maxTotalPeers) {
-        socket.close(1013, "too many peers");
-        return;
-      }
-      const remoteAddress = req.socket.remoteAddress ?? "unknown";
-      this.registerPeer(socket, "inbound", remoteAddress);
-    });
+    this.wireInbound(new WebSocketServer({ port, host, path: "/p2p" }));
   }
 
   // -- Outbound: dial seeds + discovered peers ------------------------------
 
   /** Dials every seed address immediately, then keeps topping up to `minOutboundPeers` on a timer as connections drop or new addresses are discovered. */
   start(): void {
+    if (this.closed || this.reconnectTimer) return;
     for (const addr of this.seedAddresses) this.dial(addr);
     this.reconnectTimer = setInterval(() => this.maintainOutbound(), RECONNECT_INTERVAL_MS);
+    this.reconnectTimer.unref?.();
   }
 
   stop(): void {
+    if (this.closed) return;
     this.closed = true;
     if (this.reconnectTimer) clearInterval(this.reconnectTimer);
     for (const peer of this.peers) peer.close("node shutting down");
     this.peers.clear();
-    this.wss?.close();
+    // `close()` alone doesn't drop already-open sockets on a noServer instance; terminate any stragglers.
+    if (this.wss) {
+      for (const client of this.wss.clients) client.terminate();
+      this.wss.close();
+      this.wss = undefined;
+    }
   }
 
   private maintainOutbound(): void {
@@ -180,6 +218,7 @@ export class PeerManager {
     const cleanup = () => this.outboundInFlight.delete(normalized);
     socket.once("open", () => {
       cleanup();
+      if (this.closed) return void socket.close();
       this.registerPeer(socket, "outbound", normalized);
     });
     socket.once("error", cleanup);
