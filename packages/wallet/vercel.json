@@ -1,6 +1,6 @@
 {
-  "buildCommand": "pnpm --filter @weave/wallet build",
-  "installCommand": "pnpm install",
-  "outputDirectory": "packages/wallet/dist",
+  "buildCommand": "cd ../.. && pnpm --filter @weave/wallet build",
+  "installCommand": "cd ../.. && pnpm install",
+  "outputDirectory": "dist",
   "framework": "vite"
 }
