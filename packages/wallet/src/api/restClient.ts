@@ -152,9 +152,4 @@ export class RestClient {
     });
   }
 }
-WEAVE_EOF
-echo done
-Output
-
-done
 
