@@ -84,9 +84,3 @@ function QrIcon() {
     </svg>
   );
 }
-WEAVE_EOF
-echo done
-Output
-
-done
-Now a 
