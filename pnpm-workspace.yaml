@@ -1,6 +1,6 @@
 packages:
   - "packages/*"
 
-onlyBuiltDependencies:
-  - classic-level
-  - esbuild
+allowBuilds:
+  classic-level: true
+  esbuild: true
