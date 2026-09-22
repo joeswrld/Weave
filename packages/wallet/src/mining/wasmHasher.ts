@@ -91,7 +91,7 @@ async function doLoad(): Promise<WasmHasher | null> {
     // `WebAssemblyInstantiatedSource`, dropping `.instance`. Asserting the
     // (correct, spec-accurate) result type sidesteps that ambiguity rather
     // than changing shared lib config for the whole wallet package.
-    const result = (await WebAssembly.instantiate(bytes, {})) as WebAssembly.WebAssemblyInstantiatedSource;
+    const result = (await WebAssembly.instantiate(bytes, {})) as unknown as WebAssembly.WebAssemblyInstantiatedSource;
     const exports = result.instance.exports as unknown as Sha256dExports;
     const mem = new Uint8Array(exports.mem.buffer);
 
