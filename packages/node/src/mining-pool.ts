@@ -16,13 +16,18 @@
  *    work for every valid share — 1 share at target difficulty D counts
  *    as D units of work, so a round mixing different share targets (see
  *    `maybeRetargetSession` below) still splits fairly.
- *  - Every so often, a share that happens to ALSO beat the *real* network
- *    target is a genuine block. The pool builds a coinbase that pays every
- *    contributor in the current round proportionally to their accumulated
- *    work (using @weave/core's multi-output coinbase support — see
- *    transaction.ts's createCoinbaseTransaction doc comment: "a mining
- *    pool can pay several participants directly in the coinbase"), submits
- *    it to the node like any other block, and starts a fresh round.
+ *  - Every candidate handed out by getWork already carries a coinbase that
+ *    pays every contributor in the current round proportionally to their
+ *    accumulated work (using @weave/core's multi-output coinbase support
+ *    — see transaction.ts's createCoinbaseTransaction doc comment: "a
+ *    mining pool can pay several participants directly in the coinbase").
+ *    This has to be decided before a miner starts searching nonces, not
+ *    after: the coinbase is committed to by the header's merkle root, so
+ *    changing it after the fact would change the block hash and silently
+ *    invalidate whatever nonce was found. Every so often, a share that
+ *    happens to ALSO beat the *real* network target is a genuine block —
+ *    the pool submits the (already-final) candidate to the node like any
+ *    other block and starts a fresh round.
  *  - This class never trusts a miner's own claim about how much work it
  *    did — every share is independently re-hashed and PoW-checked here
  *    before being credited, same "never trust the peer, verify" spirit as
@@ -43,6 +48,7 @@
 
 import {
   compactToTarget,
+  computeMerkleRootOfTransactions,
   createCoinbaseTransaction,
   createLockingScript,
   deserializeBlock,
@@ -177,6 +183,16 @@ export class MiningPool {
    * network target for reference/UI purposes only). Creates or reuses this
    * address's session so its personal share target can adapt over time
    * (see maybeRetargetSession).
+   *
+   * The coinbase handed out here already pays the *whole current round*
+   * proportionally (see buildRoundCoinbase) — not just `address` — because
+   * the coinbase is part of what the miner's nonce search commits to via
+   * the merkle root. Swapping it for a different coinbase after a nonce is
+   * found would change the merkle root and therefore the block hash,
+   * silently invalidating whatever nonce was found (the hash the miner
+   * searched for would no longer be the hash the new header actually
+   * produces). So the payout must be finalized before work goes out, not
+   * after a share comes back.
    */
   getWork(address: string) {
     const pkh = addressToPubKeyHash(address);
@@ -208,14 +224,13 @@ export class MiningPool {
     const extra = Buffer.alloc(4);
     extra.writeUInt32BE(Math.floor(Math.random() * 0xffff_ffff));
 
-    // Payout script here is a placeholder — every candidate's coinbase
-    // pays the requesting address alone at this point, purely so the
-    // candidate is structurally well-formed to hand out. If this
-    // candidate turns out to contain the winning nonce, submitShare
-    // discards this coinbase entirely and rebuilds it as a proportional
-    // multi-output payout across the whole round (see
-    // rebuildWithRoundCoinbase) before ever handing it to the node.
-    const { block, totalFees } = assembleCandidateBlock({
+    // Build with a single-payee placeholder first just to learn this
+    // candidate's fee total (assembleCandidateBlock computes that against
+    // the actual mempool selection for this height/timestamp), then
+    // replace the coinbase with the full round's proportional payout
+    // before it's ever handed to a miner — see this method's doc comment
+    // for why that has to happen now and not in submitShare.
+    const { block: draft, totalFees } = assembleCandidateBlock({
       height: tip.height + 1,
       prevHash: tip.hash,
       difficultyTarget: networkDifficultyBits,
@@ -224,6 +239,7 @@ export class MiningPool {
       coinbaseExtraData: new Uint8Array(extra),
       timestamp: Math.max(Math.floor(Date.now() / 1000), tip.block.header.timestamp + 1),
     });
+    const block = this.buildRoundCoinbase(draft, tip.height + 1, totalFees, pkh);
 
     return {
       height: tip.height + 1,
@@ -297,14 +313,14 @@ export class MiningPool {
       };
     }
 
-    // This share also clears the real network target: it's a block. Build
-    // the round's payout coinbase in place of whatever placeholder
-    // coinbase the candidate shipped with, then submit through the node's
-    // normal path (which independently re-validates everything, including
-    // this coinbase's total against subsidy+fees — see utxo.ts).
-    const payoutBlock = this.rebuildWithRoundCoinbase(block);
-    const result = this.node.acceptLocalBlock(payoutBlock);
-    const blockHashHex = getBlockHashHex(payoutBlock.header);
+    // This share also clears the real network target: it's a block. The
+    // candidate's coinbase already pays the round's proportional split —
+    // fixed back at getWork, before this nonce was searched for (see
+    // getWork's doc comment) — so `block` can go straight to the node's
+    // normal acceptance path (which independently re-validates everything,
+    // including this coinbase's total against subsidy+fees — see utxo.ts).
+    const result = this.node.acceptLocalBlock(block);
+    const blockHashHex = getBlockHashHex(block.header);
 
     if (result.ok) {
       this.poolBlocksFound += 1;
@@ -366,29 +382,48 @@ export class MiningPool {
   }
 
   /**
-   * Replaces `block`'s coinbase with one paying every contributor in the
-   * current round proportionally to their accumulated work, using
-   * @weave/core's multi-output coinbase support. Contributors whose share
-   * would round to below MIN_PAYOUT_SMALLEST_UNITS are simply omitted —
-   * their work still counts once more shares accumulate in future rounds,
-   * they just don't get a dust output this time (any smallest units freed
-   * up by omission stay unclaimed by design, same as how a solo miner's
-   * coinbase is allowed to pay *up to* — not necessarily exactly —
-   * subsidy+fees; see utxo.ts's coinbase check).
+   * Replaces `draft`'s single-payee coinbase with one paying every
+   * contributor in the current round proportionally to their accumulated
+   * work, using @weave/core's multi-output coinbase support, and
+   * recomputes the header's merkle root to match — all *before* handing
+   * the candidate to a miner (see getWork's doc comment for why this can't
+   * happen after the fact, once a nonce has been searched for).
+   *
+   * `requesterPkh` covers the case where the round has no accumulated work
+   * yet (e.g. the first getWork of a fresh round): rather than build a
+   * zero-output coinbase, the requesting session is paid the full reward,
+   * same as buildProportionalOutputs's own empty-round fallback would if
+   * the round were merely thin rather than completely empty.
+   *
+   * Contributors whose share would round to below MIN_PAYOUT_SMALLEST_UNITS
+   * are simply omitted — their work still counts once more shares
+   * accumulate in future rounds, they just don't get a dust output this
+   * time (any smallest units freed up by omission stay unclaimed by
+   * design, same as how a solo miner's coinbase is allowed to pay *up to*
+   * — not necessarily exactly — subsidy+fees; see utxo.ts's coinbase
+   * check).
    */
-  private rebuildWithRoundCoinbase(block: Block): Block {
-    const height = this.node.chain.height + 1;
-    const totalFees = coinbaseFeesFromCandidate(block, height);
+  private buildRoundCoinbase(
+    draft: Block,
+    height: number,
+    totalFees: bigint,
+    requesterPkh: Uint8Array,
+  ): Block {
     const totalReward = BigInt(getBlockRewardSmallestUnits(height)) + totalFees;
 
     const totalWork = [...this.round.values()].reduce((s, c) => s + c.workUnits, 0);
     const outputs =
       totalWork > 0
         ? buildProportionalOutputs(this.round, totalWork, totalReward)
-        : []; // handled by buildProportionalOutputs's own empty-round fallback below
+        : [{ value: totalReward, lockingScript: createLockingScript(requesterPkh) }];
 
-    const coinbase = createCoinbaseTransaction(height, outputs, coinbaseExtraFromCandidate(block));
-    return { header: block.header, transactions: [coinbase, ...block.transactions.slice(1)] };
+    const coinbase = createCoinbaseTransaction(height, outputs, coinbaseExtraFromCandidate(draft));
+    const transactions = [coinbase, ...draft.transactions.slice(1)];
+    const header: BlockHeader = {
+      ...draft.header,
+      merkleRoot: computeMerkleRootOfTransactions(transactions),
+    };
+    return { header, transactions };
   }
 
   // ------------------------------------------------------------- read-only
@@ -480,17 +515,6 @@ function buildProportionalOutputs(
     outputs.push({ value: totalReward, lockingScript: createLockingScript(hexToBytes(top.addressHex)) });
   }
   return outputs;
-}
-
-function coinbaseFeesFromCandidate(block: Block, height: number): bigint {
-  // The candidate's own (placeholder) coinbase already encodes subsidy +
-  // fees correctly (assembleCandidateBlock computed it against this exact
-  // mempool selection) — total minus the known subsidy recovers fees
-  // without re-summing the mempool ourselves.
-  const existingCoinbaseTotal = block.transactions[0]!.outputs.reduce((s, o) => s + o.value, 0n);
-  const subsidy = BigInt(getBlockRewardSmallestUnits(height));
-  const fees = existingCoinbaseTotal - subsidy;
-  return fees > 0n ? fees : 0n;
 }
 
 function coinbaseExtraFromCandidate(block: Block): Uint8Array | undefined {
