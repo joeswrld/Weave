@@ -498,6 +498,37 @@ button {
   line-height: 1.5;
 }
 
+.mode-toggle {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.mode-toggle .btn {
+  flex: 1;
+  padding: 8px 0;
+  font-size: 13px;
+}
+
+.pool-round-list {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+
+.pool-round-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.pool-round-row:last-child {
+  border-bottom: none;
+}
+
 /* --- toasts / banners ------------------------------------------------------- */
 
 .banner {
