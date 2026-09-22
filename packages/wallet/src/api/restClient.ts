@@ -69,6 +69,33 @@ export interface GetWorkResponse {
   totalFees: string;
 }
 
+/** Phase 8 pool getwork: same shape as solo, plus the easier `shareTarget`
+ *  the client should actually search against (see mining-pool.ts). */
+export interface PoolGetWorkResponse extends GetWorkResponse {
+  shareTarget: string;
+}
+
+export interface SubmitShareResponse {
+  ok: boolean;
+  reason?: string;
+  wasBlock?: boolean;
+  blockHash?: string;
+  blockAccepted?: boolean;
+  blockRejectReason?: string;
+  newShareTargetHex?: string;
+}
+
+export interface PoolStatusResponse {
+  active: boolean;
+  round: {
+    contributors: { addressHex: string; workUnits: number; shareCount: number; sharePct: number }[];
+    totalWorkUnits: number;
+    startedAt: number;
+  };
+  poolBlocksFound: number;
+  sessionCount: number;
+}
+
 export interface SubmitBlockResponse {
   ok: boolean;
   reason?: string;
@@ -151,5 +178,20 @@ export class RestClient {
       body: JSON.stringify({ blockHex }),
     });
   }
-}
 
+  getPoolWork(address: string): Promise<PoolGetWorkResponse> {
+    return this.request(`/api/pool/getwork/${encodeURIComponent(address)}`);
+  }
+
+  submitShare(address: string, blockHex: string, nonce: number): Promise<SubmitShareResponse> {
+    return this.request("/api/pool/submitshare", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ address, blockHex, nonce }),
+    });
+  }
+
+  getPoolStatus(): Promise<PoolStatusResponse> {
+    return this.request("/api/pool/status");
+  }
+}
