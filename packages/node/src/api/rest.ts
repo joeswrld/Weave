@@ -158,5 +158,27 @@ export function createApp(node: WeaveNode): Express {
   });
 
   registerWorkRoutes(app, node);
+
+  // Phase 8 pool routes: alternate to solo getwork/submitblock above, for
+  // browser tabs that want to mine together and split rewards by
+  // contributed work — see mining-pool.ts's header comment for the full
+  // design. Kept as thin wrappers here (rather than inside getWork.ts)
+  // since they talk to node.pool, not node.chain/mempool directly.
+  app.get("/api/pool/getwork/:address", (req, res) => {
+    const work = node.pool.getWork(req.params.address);
+    if ("error" in work) return void res.status(400).json(work);
+    res.json(work);
+  });
+
+  app.post("/api/pool/submitshare", (req, res) => {
+    const { address, blockHex, nonce } = req.body ?? {};
+    if (typeof address !== "string" || typeof blockHex !== "string" || typeof nonce !== "number") {
+      return void res.status(400).json({ ok: false, reason: "address, blockHex, nonce required" });
+    }
+    res.json(node.pool.submitShare(address, blockHex, nonce));
+  });
+
+  app.get("/api/pool/status", (_req, res) => res.json(node.pool.status()));
+
   return app;
 }
