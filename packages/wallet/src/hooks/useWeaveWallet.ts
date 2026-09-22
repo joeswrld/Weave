@@ -1,4 +1,3 @@
-
 /**
  * Single hook that ties together keystore.ts (key storage), restClient.ts
  * (balance/UTXOs/broadcast), wsClient.ts (live updates), and minerPool.ts
@@ -13,7 +12,7 @@ import { generateWallet, hasWallet, importWallet, unlockWallet, type UnlockedWal
 import { buildAndSignTransaction } from "../wallet/txBuilder";
 import { RestClient, type BlockchainInfo, type UtxoResponse } from "../api/restClient";
 import { WalletFeedClient, type ConnectionState } from "../api/wsClient";
-import { MinerPool, type MinerStatus } from "../mining/minerPool";
+import { MinerPool, type MinerStatus, type MiningMode } from "../mining/minerPool";
 
 export type SetupState = "loading" | "needs-setup" | "ready";
 
@@ -157,6 +156,10 @@ export function useWeaveWallet(nodeUrl: string) {
     minerRef.current?.setWorkerCount(count);
   }, []);
 
+  const setMiningMode = useCallback((mode: MiningMode) => {
+    minerRef.current?.setMode(mode);
+  }, []);
+
   return {
     setupState,
     wallet,
@@ -172,6 +175,7 @@ export function useWeaveWallet(nodeUrl: string) {
     startMining,
     stopMining,
     setMinerWorkerCount,
+    setMiningMode,
     refresh: () => wallet && refreshBalanceAndUtxos(wallet.address),
   };
 }
