@@ -1,4 +1,3 @@
-
 import { useState } from "react";
 import { useWeaveWallet } from "./hooks/useWeaveWallet";
 import { Onboarding } from "./pages/Onboarding";
@@ -86,6 +85,7 @@ export default function App() {
         onStart={wallet.startMining}
         onStop={wallet.stopMining}
         onWorkerCountChange={wallet.setMinerWorkerCount}
+        onModeChange={wallet.setMiningMode}
       />
 
       <UtxoList utxos={wallet.utxos} />
