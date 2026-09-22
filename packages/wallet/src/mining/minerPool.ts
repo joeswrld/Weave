@@ -25,7 +25,7 @@
  * the node — this class just reports what the node said).
  */
 
-import type { PoolStatusResponse, RestClient } from "../api/restClient";
+import type { GetWorkResponse, PoolGetWorkResponse, PoolStatusResponse, RestClient } from "../api/restClient";
 
 export type MiningMode = "solo" | "pool";
 
@@ -196,7 +196,7 @@ export class MinerPool {
     this.currentWorkVersion += 1;
     const version = this.currentWorkVersion;
 
-    let work;
+    let work: GetWorkResponse | PoolGetWorkResponse;
     try {
       work = this.mode === "pool" ? await this.rest.getPoolWork(this.payoutAddress) : await this.rest.getWork(this.payoutAddress);
     } catch (err) {
@@ -211,7 +211,11 @@ export class MinerPool {
 
     this.lastError = null;
     this.currentTargetHex = work.target;
-    this.currentShareTarget = "shareTarget" in work ? work.shareTarget : work.target;
+    // "pool" mode responses include the (easier) shareTarget workers should
+    // actually search against; solo mode's GetWorkResponse has no such
+    // field, so fall back to the real network target.
+    const poolShareTarget = (work as Partial<PoolGetWorkResponse>).shareTarget;
+    this.currentShareTarget = typeof poolShareTarget === "string" ? poolShareTarget : work.target;
     const searchTarget = this.currentShareTarget!;
 
     const sliceSize = Math.floor(NONCE_SPACE / this.workerCount);
