@@ -3,6 +3,10 @@ services:
     name: weave-node
     runtime: docker
     plan: free
+    # Build context is the monorepo root — packages/node/Dockerfile's
+    # `COPY . .` needs every workspace package (core, crypto, protocol),
+    # not just packages/node, so the context can't be scoped down to that
+    # subdirectory the way it could for a single-package service.
     dockerContext: .
     dockerfilePath: ./packages/node/Dockerfile
     envVars:
@@ -13,3 +17,20 @@ services:
       mountPath: /data
       sizeGB: 1
     healthCheckPath: /health
+
+  - type: web
+    name: weave-wallet
+    runtime: static
+    # Build runs from the repo root (not packages/wallet) because
+    # @weave/core / @weave/crypto are consumed as workspace TS sources —
+    # the wallet build needs the whole pnpm workspace present, same as
+    # the node service's Docker build does.
+    buildCommand: corepack enable && pnpm install --frozen-lockfile=false && pnpm --filter @weave/wallet run build
+    staticPublishPath: packages/wallet/dist
+    routes:
+      # SPA fallback so deep links / page refreshes don't 404 — everything
+      # not an actual static asset resolves to index.html and React Router
+      # (or whatever client-side routing the app uses) takes it from there.
+      - type: rewrite
+        source: /*
+        destination: /index.html
