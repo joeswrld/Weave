@@ -276,6 +276,15 @@ export class MiningPool {
     const addressHex = Buffer.from(pkh).toString("hex");
     const session = this.sessions.get(addressHex);
     if (!session) return { ok: false, reason: "no active session for this address — call getwork first" };
+    // A share is just as much a sign of life as a getWork call — sessions
+    // that mine steadily on one long-lived candidate (no exhaustion, no new
+    // tip) may go many minutes between getWork calls while still actively
+    // submitting shares; only bumping lastSeenAt in getWork would let
+    // pruneIdleSessions evict a perfectly active miner mid-round, silently
+    // resetting their accumulated workUnits to zero and dropping every
+    // share submitted right after until the client's next getWork refetch
+    // recreates the session from scratch.
+    session.lastSeenAt = Date.now();
 
     if (typeof blockHex !== "string" || !/^[0-9a-fA-F]+$/.test(blockHex) || blockHex.length > 4_000_000) {
       return { ok: false, reason: "invalid blockHex" };
