@@ -1,13 +1,14 @@
 import { useState } from "react";
 import { TARGET_BLOCK_TIME_SECONDS } from "@weave/core";
-import type { MinerStatus } from "../mining/minerPool";
-import { estimateNetworkHashrate, estimateSecondsToBlock, formatEtaSeconds, formatHashrate } from "../lib/format";
+import type { MinerStatus, MiningMode } from "../mining/minerPool";
+import { estimateNetworkHashrate, estimateSecondsToBlock, formatEtaSeconds, formatHashrate, shortenAddress } from "../lib/format";
 
 interface MiningPanelProps {
   status: MinerStatus | null;
   onStart: () => void;
   onStop: () => void;
   onWorkerCountChange: (count: number) => void;
+  onModeChange: (mode: MiningMode) => void;
 }
 
 /**
@@ -22,11 +23,12 @@ interface MiningPanelProps {
  * discouraging by design — that's the honest picture, not a bug in the
  * estimate.
  */
-export function MiningPanel({ status, onStart, onStop, onWorkerCountChange }: MiningPanelProps) {
+export function MiningPanel({ status, onStart, onStop, onWorkerCountChange, onModeChange }: MiningPanelProps) {
   const maxWorkers = Math.max(1, Math.min(navigator.hardwareConcurrency || 4, 8));
   const [workerCount, setWorkerCount] = useState(Math.min(2, maxWorkers));
 
   const running = status?.running ?? false;
+  const mode = status?.mode ?? "pool";
 
   const networkHashrate =
     status?.currentTargetHex ? estimateNetworkHashrate(status.currentTargetHex, TARGET_BLOCK_TIME_SECONDS) : null;
@@ -39,13 +41,30 @@ export function MiningPanel({ status, onStart, onStop, onWorkerCountChange }: Mi
     <div className="card">
       <p className="card-label">Mining</p>
 
+      {!running && (
+        <div className="mode-toggle">
+          <button
+            className={`btn ${mode === "pool" ? "btn-primary" : "btn-ghost"}`}
+            onClick={() => onModeChange("pool")}
+          >
+            Pool
+          </button>
+          <button
+            className={`btn ${mode === "solo" ? "btn-primary" : "btn-ghost"}`}
+            onClick={() => onModeChange("solo")}
+          >
+            Solo
+          </button>
+        </div>
+      )}
+
       <div className="hashrate-display">
         {status && running ? formatHashrate(status.hashesPerSecond) : "0 H/s"}
       </div>
 
       <div className="mining-grid">
         <div>
-          <div className="mining-stat-label">Blocks found</div>
+          <div className="mining-stat-label">{mode === "pool" ? "Shares found" : "Blocks found"}</div>
           <div className="mining-stat-value">{status?.blocksFound ?? 0}</div>
         </div>
         <div>
@@ -94,11 +113,32 @@ export function MiningPanel({ status, onStart, onStop, onWorkerCountChange }: Mi
         </div>
       )}
 
+      {mode === "pool" && running && status?.poolStatus && (
+        <div style={{ marginTop: 4 }}>
+          <div className="mining-stat-label">
+            Pool round ({status.poolStatus.round.contributors.length} contributor
+            {status.poolStatus.round.contributors.length === 1 ? "" : "s"})
+          </div>
+          {status.poolStatus.round.contributors.length > 0 ? (
+            <ul className="pool-round-list">
+              {status.poolStatus.round.contributors.map((c) => (
+                <li key={c.addressHex} className="pool-round-row">
+                  <span>{shortenAddress(c.addressHex, 6, 4)}</span>
+                  <span>{c.sharePct.toFixed(1)}%</span>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="mining-disclaimer" style={{ marginTop: 4 }}>
+              No shares submitted yet this round.
+            </p>
+          )}
+        </div>
+      )}
+
       {status?.lastResult && (
-        <div className={`banner ${status.lastResult.accepted ? "banner-success" : "banner-error"}`} style={{ marginTop: 12 }}>
-          {status.lastResult.accepted
-            ? `Block accepted${status.lastResult.hash ? ` — ${status.lastResult.hash.slice(0, 12)}…` : ""}`
-            : `Block rejected: ${status.lastResult.reason ?? "unknown reason"}`}
+        <div className={`banner ${resultBannerClass(status.lastResult)}`} style={{ marginTop: 12 }}>
+          {resultBannerText(status.lastResult)}
         </div>
       )}
 
@@ -126,4 +166,23 @@ export function MiningPanel({ status, onStart, onStop, onWorkerCountChange }: Mi
       </p>
     </div>
   );
+}
+
+/**
+ * The three outcomes a mining attempt can report (see MinerStatus.lastResult
+ * and minerPool.ts's handleWorkerMessage): a plain accepted/rejected block
+ * (solo mode, or pool mode when a share also cleared the real network
+ * target), or an ordinary accepted share (pool mode's common case — credited
+ * work, no payout yet) — each needs its own wording so "share accepted"
+ * doesn't read as "you just got paid".
+ */
+function resultBannerClass(result: NonNullable<MinerStatus["lastResult"]>): string {
+  if (result.wasShare) return "banner-success";
+  return result.accepted ? "banner-success" : "banner-error";
+}
+
+function resultBannerText(result: NonNullable<MinerStatus["lastResult"]>): string {
+  if (result.wasShare) return "Share accepted";
+  if (result.accepted) return `Block accepted${result.hash ? ` — ${result.hash.slice(0, 12)}…` : ""}`;
+  return `Block rejected: ${result.reason ?? "unknown reason"}`;
 }
