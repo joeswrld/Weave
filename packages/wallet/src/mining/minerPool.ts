@@ -1,40 +1,64 @@
 /**
- * Coordinates a pool of miner.worker.ts instances against a node's
- * get-work/submit-block API (Phase 8). Scales worker count to
- * navigator.hardwareConcurrency by default, splits the 32-bit nonce space
- * evenly across them, and re-fetches work whenever the chain tip moves
- * (a new block from anyone invalidates the current candidate) or a worker
- * exhausts its assigned nonce range without finding one.
+ * Coordinates a pool of miner.worker.ts instances against a node's Phase 8
+ * mining API. Scales worker count to navigator.hardwareConcurrency by
+ * default, splits the 32-bit nonce space evenly across them, and re-fetches
+ * work whenever the chain tip moves (a new block from anyone invalidates
+ * the current candidate) or a worker exhausts its assigned nonce range
+ * without finding one.
+ *
+ * Two modes, chosen by the caller (see MiningPanel's mode toggle):
+ *   - "solo": talks to /api/getwork + /api/submitblock. Workers search
+ *     against the real network target; a find pays this address alone.
+ *     Realistic for solo miners only at very low network difficulty.
+ *   - "pool": talks to /api/pool/getwork + /api/pool/submitshare, which
+ *     hand out and check a much easier "share target" (see the node's
+ *     mining-pool.ts). Most finds are just shares (credited work, no
+ *     payout yet); occasionally one also clears the real network target
+ *     and the pool submits it as a block, paying every contributor of the
+ *     current round proportionally. This is the practical way for a
+ *     single browser tab to see *any* return before real-world difficulty
+ *     makes solo mining a lottery with a vanishingly small ticket.
  *
  * This class owns *when* to fetch work and what to do with a found nonce;
  * it does not do any hashing itself (that's the workers) and does not
- * decide whether a submitted block was actually accepted (that's the
- * node — this class just reports what the node said).
+ * decide whether a submitted block/share was actually accepted (that's
+ * the node — this class just reports what the node said).
  */
 
-import type { RestClient } from "../api/restClient";
+import type { PoolStatusResponse, RestClient } from "../api/restClient";
+
+export type MiningMode = "solo" | "pool";
 
 export interface MinerStatus {
   running: boolean;
+  mode: MiningMode;
   hashesPerSecond: number;
   workerCount: number;
+  /** Solo mode: full blocks this session found and had accepted. Pool
+   *  mode: shares this session found (see poolStatus for pool-wide block
+   *  finds, which aren't attributable to one session in the UI). */
   blocksFound: number;
-  lastResult: { accepted: boolean; hash?: string; reason?: string } | null;
+  lastResult: { accepted: boolean; hash?: string; reason?: string; wasShare?: boolean } | null;
   lastError: string | null;
-  /** Big-endian hex target of the candidate currently being searched, so
-   *  the UI can derive a network-hashrate / ETA-to-block estimate (see
-   *  lib/format.ts's estimateNetworkHashrate) without a separate API call
-   *  — this is exactly the target the workers are searching against right
-   *  now, more precise than re-deriving it from blockchaininfo. */
+  /** Big-endian hex target the workers are actually searching against
+   *  right now — the real network target in solo mode, the (easier) share
+   *  target in pool mode — so the UI can derive a network-hashrate / ETA
+   *  estimate (see lib/format.ts's estimateNetworkHashrate) without a
+   *  separate API call. */
   currentTargetHex: string | null;
   /** Whether at least one worker reported using the WASM hasher vs. the
    *  pure-JS fallback — purely informational (see miner.worker.ts). */
   hashMode: "wasm" | "js" | null;
+  /** Pool mode only: the current round's contributors and this session's
+   *  share of it, polled from /api/pool/status. Null in solo mode or
+   *  before the first poll completes. */
+  poolStatus: PoolStatusResponse | null;
 }
 
 type Listener = (status: MinerStatus) => void;
 
 const NONCE_SPACE = 0x1_0000_0000; // 2^32, full u32 nonce range
+const POOL_STATUS_POLL_MS = 5000;
 
 export class MinerPool {
   private workers: Worker[] = [];
@@ -45,14 +69,19 @@ export class MinerPool {
   private lastError: string | null = null;
   private currentWorkVersion = 0;
   private currentTargetHex: string | null = null;
+  private currentShareTarget: string | null = null; // pool mode: what workers actually search against
   private hashMode: MinerStatus["hashMode"] = null;
+  private currentBlockHex: string | null = null;
+  private poolStatus: PoolStatusResponse | null = null;
   private refetchTimer: ReturnType<typeof setTimeout> | null = null;
+  private poolPollTimer: ReturnType<typeof setInterval> | null = null;
   private readonly listeners = new Set<Listener>();
 
   constructor(
     private readonly rest: RestClient,
     private readonly payoutAddress: string,
     private workerCount: number = Math.max(1, Math.min(navigator.hardwareConcurrency || 2, 8)),
+    private mode: MiningMode = "pool",
   ) {}
 
   onStatus(fn: Listener): () => void {
@@ -64,13 +93,15 @@ export class MinerPool {
     const total = this.perWorkerHashrate.reduce((a, b) => a + b, 0);
     const status: MinerStatus = {
       running: this.running,
+      mode: this.mode,
       hashesPerSecond: total,
       workerCount: this.workerCount,
       blocksFound: this.blocksFound,
       lastResult: this.lastResult,
       lastError: this.lastError,
-      currentTargetHex: this.currentTargetHex,
+      currentTargetHex: this.mode === "pool" ? this.currentShareTarget : this.currentTargetHex,
       hashMode: this.hashMode,
+      poolStatus: this.poolStatus,
     };
     for (const fn of this.listeners) fn(status);
   }
@@ -79,7 +110,19 @@ export class MinerPool {
     this.workerCount = Math.max(1, count);
     if (this.running) {
       this.stop();
-      this.start();
+      void this.start();
+    }
+  }
+
+  /** Switches between solo and pool mining. Restarts if currently running,
+   *  same as changing the worker count — a mode change means a whole new
+   *  candidate/target shape, not something to patch in place. */
+  setMode(mode: MiningMode): void {
+    if (mode === this.mode) return;
+    this.mode = mode;
+    if (this.running) {
+      this.stop();
+      void this.start();
     }
   }
 
@@ -99,6 +142,11 @@ export class MinerPool {
       this.workers.push(worker);
     }
 
+    if (this.mode === "pool") {
+      void this.pollPoolStatus();
+      this.poolPollTimer = setInterval(() => void this.pollPoolStatus(), POOL_STATUS_POLL_MS);
+    }
+
     this.emit();
     await this.fetchAndDispatchWork();
   }
@@ -109,6 +157,10 @@ export class MinerPool {
       clearTimeout(this.refetchTimer);
       this.refetchTimer = null;
     }
+    if (this.poolPollTimer) {
+      clearInterval(this.poolPollTimer);
+      this.poolPollTimer = null;
+    }
     for (const w of this.workers) {
       w.postMessage({ type: "stop" });
       w.terminate();
@@ -116,7 +168,9 @@ export class MinerPool {
     this.workers = [];
     this.perWorkerHashrate = [];
     this.currentTargetHex = null;
+    this.currentShareTarget = null;
     this.hashMode = null;
+    this.poolStatus = null;
     this.emit();
   }
 
@@ -126,6 +180,17 @@ export class MinerPool {
     if (this.running) void this.fetchAndDispatchWork();
   }
 
+  private async pollPoolStatus(): Promise<void> {
+    if (!this.running || this.mode !== "pool") return;
+    try {
+      this.poolStatus = await this.rest.getPoolStatus();
+      this.emit();
+    } catch {
+      // Non-fatal: the round-contributors panel just goes stale until the
+      // next successful poll; mining itself doesn't depend on this.
+    }
+  }
+
   private async fetchAndDispatchWork(): Promise<void> {
     if (!this.running) return;
     this.currentWorkVersion += 1;
@@ -133,7 +198,7 @@ export class MinerPool {
 
     let work;
     try {
-      work = await this.rest.getWork(this.payoutAddress);
+      work = this.mode === "pool" ? await this.rest.getPoolWork(this.payoutAddress) : await this.rest.getWork(this.payoutAddress);
     } catch (err) {
       this.lastError = (err as Error).message;
       this.emit();
@@ -146,6 +211,9 @@ export class MinerPool {
 
     this.lastError = null;
     this.currentTargetHex = work.target;
+    this.currentShareTarget = "shareTarget" in work ? work.shareTarget : work.target;
+    const searchTarget = this.currentShareTarget!;
+
     const sliceSize = Math.floor(NONCE_SPACE / this.workerCount);
     this.workers.forEach((worker, i) => {
       const nonceStart = i * sliceSize;
@@ -159,14 +227,14 @@ export class MinerPool {
           timestamp: work.header.timestamp,
           difficultyTarget: work.header.difficultyTarget,
         },
-        targetHex: work.target,
+        targetHex: searchTarget,
         nonceStart,
         nonceEnd,
         workerIndex: i,
       });
     });
 
-    (this as unknown as { currentBlockHex: string }).currentBlockHex = work.blockHex;
+    this.currentBlockHex = work.blockHex;
     this.emit();
   }
 
@@ -194,16 +262,34 @@ export class MinerPool {
       // candidate that's about to be superseded either way.
       for (const w of this.workers) w.postMessage({ type: "stop" });
 
-      const currentBlockHex = (this as unknown as { currentBlockHex?: string }).currentBlockHex;
+      const currentBlockHex = this.currentBlockHex;
       if (!currentBlockHex) return;
 
-      const blockWithNonce = patchNonceInBlockHex(currentBlockHex, data.nonce);
-      try {
-        const result = await this.rest.submitBlock(blockWithNonce);
-        this.lastResult = { accepted: result.ok, hash: result.hash, reason: result.reason };
-        if (result.ok) this.blocksFound += 1;
-      } catch (err) {
-        this.lastResult = { accepted: false, reason: (err as Error).message };
+      if (this.mode === "pool") {
+        try {
+          const result = await this.rest.submitShare(this.payoutAddress, currentBlockHex, data.nonce);
+          if (!result.ok) {
+            this.lastResult = { accepted: false, reason: result.reason };
+          } else if (result.wasBlock) {
+            this.lastResult = { accepted: !!result.blockAccepted, hash: result.blockHash, reason: result.blockRejectReason, wasShare: false };
+          } else {
+            // An ordinary accepted share: credited work, not (yet) a block.
+            this.blocksFound += 1; // "shares found" in pool mode — see MinerStatus doc comment
+            this.lastResult = { accepted: true, wasShare: true };
+          }
+          void this.pollPoolStatus();
+        } catch (err) {
+          this.lastResult = { accepted: false, reason: (err as Error).message };
+        }
+      } else {
+        const blockWithNonce = patchNonceInBlockHex(currentBlockHex, data.nonce);
+        try {
+          const result = await this.rest.submitBlock(blockWithNonce);
+          this.lastResult = { accepted: result.ok, hash: result.hash, reason: result.reason };
+          if (result.ok) this.blocksFound += 1;
+        } catch (err) {
+          this.lastResult = { accepted: false, reason: (err as Error).message };
+        }
       }
       this.emit();
 
@@ -220,7 +306,8 @@ export class MinerPool {
  * header, which is itself the first 80 bytes of the block — so patching
  * it in place is a fixed-offset byte write, no need to deserialize and
  * re-serialize the whole block (with its potentially many transactions)
- * just to change one field.
+ * just to change one field. (Pool mode doesn't need this: submitShare
+ * takes the blockHex and nonce separately and patches server-side.)
  */
 function patchNonceInBlockHex(blockHex: string, nonce: number): string {
   const bytes = new Uint8Array(blockHex.length / 2);
