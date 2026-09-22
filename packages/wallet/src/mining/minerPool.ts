@@ -274,6 +274,18 @@ export class MinerPool {
           const result = await this.rest.submitShare(this.payoutAddress, currentBlockHex, data.nonce);
           if (!result.ok) {
             this.lastResult = { accepted: false, reason: result.reason };
+            // The server-side session backing this candidate expired
+            // (idle-pruned) between getWork and this submission — the share
+            // itself is unrecoverable (it was built against that session's
+            // now-gone share target/round state), but silently moving on
+            // would let this repeat indefinitely on a long-idle tab,
+            // quietly dropping share after share. Force a fresh getWork now
+            // rather than waiting for the normal post-submit refetch below,
+            // so a new session — and fresh accumulated work — starts
+            // immediately instead of after another full nonce-range attempt.
+            if (result.reason?.includes("no active session")) {
+              this.lastError = "Mining session expired and was refreshed — the last share couldn't be credited.";
+            }
           } else if (result.wasBlock) {
             this.lastResult = { accepted: !!result.blockAccepted, hash: result.blockHash, reason: result.blockRejectReason, wasShare: false };
           } else {
