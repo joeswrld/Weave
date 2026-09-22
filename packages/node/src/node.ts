@@ -17,6 +17,7 @@ import type { Message } from "@weave/protocol";
 import type { ChainStore, UtxoStore, UtxoOp } from "./storage/types";
 import { Mempool } from "./mempool";
 import { assembleCandidateBlock, mineBlock } from "./miner";
+import { MiningPool } from "./mining-pool";
 import { GossipService } from "./p2p/gossip";
 import { PeerManager, generateNodeNonce } from "./p2p/peerManager";
 import type { NodeConfig } from "./config";
@@ -32,6 +33,14 @@ const hex = (b: Uint8Array) => Buffer.from(b).toString("hex");
 export class WeaveNode extends EventEmitter {
   chain!: ChainState;
   readonly mempool = new Mempool();
+  /** Phase 8: lets many browser tabs mine together and split a block's
+   *  reward by contributed work — see mining-pool.ts's header comment.
+   *  Always instantiated (it's a passive service; nothing happens unless
+   *  a client calls its getwork/submitshare routes) and started
+   *  alongside the node itself, independent of the node's own optional
+   *  solo miner (config.mining.enabled) — the two can run at once. */
+  readonly pool = new MiningPool(this);
+  private poolPruneTimer?: NodeJS.Timeout;
   peers!: PeerManager;
   gossip!: GossipService;
   /** pubkeyHash(hex) -> Set of "txid:index" — makes getbalance/listunspent O(#addr utxos). */
@@ -76,10 +85,18 @@ export class WeaveNode extends EventEmitter {
       onTxAccepted: (tx, id) => this.afterTxAccepted(tx, id),
     });
     if (this.config.mining.enabled) this.startMining();
+    this.pool.start();
+    // Idle pool sessions (a tab that navigated away without an explicit
+    // "stop mining") never submit another share, so nothing else would
+    // ever clear them out — sweep periodically rather than accumulating
+    // unbounded session state on a long-running node.
+    this.poolPruneTimer = setInterval(() => this.pool.pruneIdleSessions(10 * 60_000), 60_000);
   }
 
   async stop(): Promise<void> {
     this.stopMining();
+    this.pool.stop();
+    if (this.poolPruneTimer) clearInterval(this.poolPruneTimer);
     this.peers?.stop();
     await this.persistQueue;
   }
@@ -359,6 +376,7 @@ export class WeaveNode extends EventEmitter {
 
   blockchainInfo() {
     const tip = this.chain.tip;
+    const poolStatus = this.pool.status();
     return {
       chain: "weave",
       height: tip.height,
@@ -373,6 +391,7 @@ export class WeaveNode extends EventEmitter {
       hashrate: this.hashrate,
       retainBlocks: this.config.retainBlocks,
       orphanBlocks: this.chain.orphanCount,
+      pool: { active: poolStatus.active, sessionCount: poolStatus.sessionCount, poolBlocksFound: poolStatus.poolBlocksFound },
     };
   }
 
