@@ -75,6 +75,7 @@ export class MinerPool {
   private poolStatus: PoolStatusResponse | null = null;
   private refetchTimer: ReturnType<typeof setTimeout> | null = null;
   private poolPollTimer: ReturnType<typeof setInterval> | null = null;
+  private poolWorkRefreshTimer: ReturnType<typeof setInterval> | null = null;
   private readonly listeners = new Set<Listener>();
 
   constructor(
@@ -145,6 +146,17 @@ export class MinerPool {
     if (this.mode === "pool") {
       void this.pollPoolStatus();
       this.poolPollTimer = setInterval(() => void this.pollPoolStatus(), POOL_STATUS_POLL_MS);
+      // The candidate this session searches has its payout coinbase frozen
+      // at the getWork call that issued it (see mining-pool.ts's getWork
+      // doc comment — the split can't change once nonce search starts).
+      // Without this, a session can keep mining one candidate — built from
+      // whatever the round looked like at that one moment, sometimes an
+      // empty/single-payee round right after a reset — for as long as
+      // nonce exhaustion takes, silently excluding every share (this
+      // session's own, and every other session's) credited after that
+      // candidate was issued. Re-fetching on the same cadence as the
+      // status poll keeps that staleness window to a few seconds instead.
+      this.poolWorkRefreshTimer = setInterval(() => void this.fetchAndDispatchWork(), POOL_STATUS_POLL_MS);
     }
 
     this.emit();
@@ -160,6 +172,10 @@ export class MinerPool {
     if (this.poolPollTimer) {
       clearInterval(this.poolPollTimer);
       this.poolPollTimer = null;
+    }
+    if (this.poolWorkRefreshTimer) {
+      clearInterval(this.poolWorkRefreshTimer);
+      this.poolWorkRefreshTimer = null;
     }
     for (const w of this.workers) {
       w.postMessage({ type: "stop" });
@@ -294,6 +310,18 @@ export class MinerPool {
             this.lastResult = { accepted: true, wasShare: true };
           }
           void this.pollPoolStatus();
+          // A share just changed this round's accumulated work, but every
+          // OTHER worker in this session (and every other session) is still
+          // searching a candidate whose coinbase was frozen at its own last
+          // getWork call — see mining-pool.ts's getWork doc comment: the
+          // payout split can't be edited after a nonce search starts, only
+          // baked in before one begins. So the payout a block actually pays
+          // is only ever as fresh as the last getWork before it was found.
+          // Re-fetching work after every accepted share (not just after
+          // this worker's own find, which fetchAndDispatchWork already
+          // does below) keeps that staleness window small instead of
+          // letting a session mine one candidate — with a stale, possibly
+          // single-payee round snapshot — across many shares.
         } catch (err) {
           this.lastResult = { accepted: false, reason: (err as Error).message };
         }
