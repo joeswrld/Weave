@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: weave-node
+    runtime: docker
+    plan: free
+    dockerContext: .
+    dockerfilePath: ./packages/node/Dockerfile
+    envVars:
+      - key: WEAVE_DATA_DIR
+        value: /data
+    disk:
+      name: weave-node-data
+      mountPath: /data
+      sizeGB: 1
+    healthCheckPath: /health
