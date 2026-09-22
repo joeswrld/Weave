@@ -1,13 +1,15 @@
-# Exported from Render on 2026-09-22T01:05:35Z
-version: "1"
-projects:
-- name: weave-wallet
-  environments:
-  - name: Production
-    services:
-    - type: web
-      name: Weave-1
-      runtime: static
-      repo: https://github.com/joeswrld/Weave
-      staticPublishPath: packages/wallet/dist
-      autoDeployTrigger: commit
+services:
+  - type: web
+    name: weave-node
+    runtime: docker
+    plan: free
+    dockerContext: .
+    dockerfilePath: ./packages/node/Dockerfile
+    envVars:
+      - key: WEAVE_DATA_DIR
+        value: /data
+    disk:
+      name: weave-node-data
+      mountPath: /data
+      sizeGB: 1
+    healthCheckPath: /health
