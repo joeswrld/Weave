@@ -84,8 +84,15 @@ async function doLoad(): Promise<WasmHasher | null> {
   try {
     if (typeof WebAssembly === "undefined") return null;
     const bytes = base64ToBytes(WASM_BASE64);
-    const { instance } = await WebAssembly.instantiate(bytes, {});
-    const exports = instance.exports as unknown as Sha256dExports;
+    // Explicit result typing: with both "DOM" and "WebWorker" libs loaded
+    // (this file runs inside miner.worker.ts), TS's overload resolution
+    // for WebAssembly.instantiate(bufferSource, importObject) picks the
+    // wrong overload and infers `Instance` instead of
+    // `WebAssemblyInstantiatedSource`, dropping `.instance`. Asserting the
+    // (correct, spec-accurate) result type sidesteps that ambiguity rather
+    // than changing shared lib config for the whole wallet package.
+    const result = (await WebAssembly.instantiate(bytes, {})) as WebAssembly.WebAssemblyInstantiatedSource;
+    const exports = result.instance.exports as unknown as Sha256dExports;
     const mem = new Uint8Array(exports.mem.buffer);
 
     return {
