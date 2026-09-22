@@ -1,4 +1,3 @@
-
 /**
  * Coordinates a pool of miner.worker.ts instances against a node's
  * get-work/submit-block API (Phase 8). Scales worker count to
@@ -22,6 +21,15 @@ export interface MinerStatus {
   blocksFound: number;
   lastResult: { accepted: boolean; hash?: string; reason?: string } | null;
   lastError: string | null;
+  /** Big-endian hex target of the candidate currently being searched, so
+   *  the UI can derive a network-hashrate / ETA-to-block estimate (see
+   *  lib/format.ts's estimateNetworkHashrate) without a separate API call
+   *  — this is exactly the target the workers are searching against right
+   *  now, more precise than re-deriving it from blockchaininfo. */
+  currentTargetHex: string | null;
+  /** Whether at least one worker reported using the WASM hasher vs. the
+   *  pure-JS fallback — purely informational (see miner.worker.ts). */
+  hashMode: "wasm" | "js" | null;
 }
 
 type Listener = (status: MinerStatus) => void;
@@ -36,6 +44,8 @@ export class MinerPool {
   private lastResult: MinerStatus["lastResult"] = null;
   private lastError: string | null = null;
   private currentWorkVersion = 0;
+  private currentTargetHex: string | null = null;
+  private hashMode: MinerStatus["hashMode"] = null;
   private refetchTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly listeners = new Set<Listener>();
 
@@ -59,6 +69,8 @@ export class MinerPool {
       blocksFound: this.blocksFound,
       lastResult: this.lastResult,
       lastError: this.lastError,
+      currentTargetHex: this.currentTargetHex,
+      hashMode: this.hashMode,
     };
     for (const fn of this.listeners) fn(status);
   }
@@ -103,6 +115,8 @@ export class MinerPool {
     }
     this.workers = [];
     this.perWorkerHashrate = [];
+    this.currentTargetHex = null;
+    this.hashMode = null;
     this.emit();
   }
 
@@ -131,6 +145,7 @@ export class MinerPool {
     if (version !== this.currentWorkVersion || !this.running) return;
 
     this.lastError = null;
+    this.currentTargetHex = work.target;
     const sliceSize = Math.floor(NONCE_SPACE / this.workerCount);
     this.workers.forEach((worker, i) => {
       const nonceStart = i * sliceSize;
@@ -158,6 +173,7 @@ export class MinerPool {
   private async handleWorkerMessage(workerIndex: number, data: any): Promise<void> {
     if (data.type === "hashrate") {
       this.perWorkerHashrate[workerIndex] = data.hashesPerSecond;
+      if (data.hashMode === "wasm" || data.hashMode === "js") this.hashMode = data.hashMode;
       this.emit();
       return;
     }
