@@ -55,8 +55,13 @@ export function createWalletFeed(node: WeaveNode): WebSocketServer {
     for (const c of wss.clients) {
       if (c.readyState !== c.OPEN) continue;
       const f = filters.get(c);
-      // Reorgs always go out; blocks/txs are filtered only for clients that subscribed to addresses.
-      if (f && f.size && e.type !== "reorg" && !touched?.some((p) => f.has(p))) continue;
+      // Reorgs and new blocks always go out to every subscribed client:
+      // a wallet needs to know the chain tip advanced (to refresh its own
+      // UTXOs/mempool view, retarget its mining candidate, etc.) even for
+      // a block that didn't pay its own address — most blocks won't.
+      // Only "tx" events are actually filtered down to addresses a client
+      // subscribed to, since those are relevant purely by who they touch.
+      if (f && f.size && e.type === "tx" && !touched?.some((p) => f.has(p))) continue;
       c.send(msg);
     }
   };
