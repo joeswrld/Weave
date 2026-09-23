@@ -190,6 +190,28 @@ export function isCoinbase(tx: Transaction): boolean {
 }
 
 /**
+ * Number of signatures a non-coinbase transaction's inputs carry, for the
+ * per-signature base fee (see fees.ts's calculateBaseFee). In this
+ * codebase's current script model every input is a P2PKH input carrying
+ * exactly one signature (see script.ts's createUnlockingScript /
+ * parseUnlockingScript — there is no other script type yet), so this is
+ * simply the input count. Written as its own named function rather than
+ * inlining `tx.inputs.length` at every fee call site so that if a future
+ * script type ever carries a different number of signatures per input
+ * (e.g. multisig), there is exactly one place to update — matching this
+ * codebase's existing "one place to change" convention (see
+ * consensus/active.ts's activeConsensusAlgorithm for the same pattern).
+ * Coinbase transactions are unsigned and are never charged a fee — callers
+ * should not call this on a coinbase transaction.
+ */
+export function countSignatures(tx: Transaction): number {
+  if (isCoinbase(tx)) {
+    throw new Error("countSignatures does not apply to coinbase transactions (they are unsigned and pay no fee)");
+  }
+  return tx.inputs.length;
+}
+
+/**
  * Builds a coinbase transaction. `outputs` is an array so a mining pool can
  * pay several participants directly in the coinbase (Phase 8); a solo miner
  * passes one output. Reward-amount correctness (subsidy + fees) is checked at
