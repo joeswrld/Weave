@@ -11,12 +11,11 @@
  */
 
 import {
+  activeConsensusAlgorithm,
   assembleBlock,
   compactToTarget,
   createCoinbaseTransaction,
-  getBlockHash,
   getBlockRewardSmallestUnits,
-  hashMeetsTarget,
   type Block,
   type BlockHeader,
   type Hash,
@@ -118,33 +117,32 @@ export interface MineResult {
 
 /**
  * The actual mining loop: hold everything in the header fixed except
- * `nonce`, re-hash, and check whether the result is below the target —
- * exactly what Phase 8's browser Web Worker will also do, just in Node
- * instead of a Worker thread. Returns null if `maxAttempts` (or the full
- * nonce space) is exhausted without success, which is completely normal at
- * real difficulty: the caller should re-assemble the candidate with a new
- * timestamp and/or a new `coinbaseExtraData` (an "extranonce" — see
- * transaction.ts's COINBASE_SCRIPT_MAX_BYTES comment) and call again, the
- * same way a real miner cycles through those once the 32-bit nonce space
- * runs out.
+ * `nonce`, re-hash under the network's activeConsensusAlgorithm (WPoW-V1 —
+ * see @weave/core's consensus/active.ts), and check whether the result is
+ * below the target — exactly what Phase 8's browser Web Worker will also
+ * do, just in Node instead of a Worker thread. This delegates to
+ * activeConsensusAlgorithm.mine rather than reimplementing the nonce
+ * search, so there is exactly one mining loop implementation, shared with
+ * WPoWV1Algorithm.mine's own unit tests/benchmark. Returns null if
+ * `maxAttempts` (or the full nonce space) is exhausted without success,
+ * which is completely normal at real difficulty: the caller should
+ * re-assemble the candidate with a new timestamp and/or a new
+ * `coinbaseExtraData` (an "extranonce" — see transaction.ts's
+ * COINBASE_SCRIPT_MAX_BYTES comment) and call again, the same way a real
+ * miner cycles through those once the 32-bit nonce space runs out.
  */
 export function mineBlock(candidate: Block, options: MineOptions = {}): MineResult | null {
   const target = compactToTarget(candidate.header.difficultyTarget);
   if (target === null) throw new RangeError("invalid difficultyTarget");
 
   const maxAttempts = Math.min(options.maxAttempts ?? MAX_NONCE + 1, MAX_NONCE + 1);
-  const progressInterval = options.progressIntervalHashes ?? 100_000;
-
-  for (let nonce = 0; nonce < maxAttempts; nonce++) {
-    const header: BlockHeader = { ...candidate.header, nonce };
-    if (hashMeetsTarget(getBlockHash(header), target)) {
-      return { block: { header, transactions: candidate.transactions }, hashesTried: nonce + 1 };
-    }
-    if (options.onProgress && (nonce + 1) % progressInterval === 0) {
-      options.onProgress(nonce + 1);
-    }
-  }
-  return null;
+  const result = activeConsensusAlgorithm.mine(candidate.header, {
+    maxAttempts,
+    onProgress: options.onProgress,
+    progressIntervalHashes: options.progressIntervalHashes ?? 100_000,
+  });
+  if (result === null) return null;
+  return { block: { header: result.header, transactions: candidate.transactions }, hashesTried: result.hashesTried };
 }
 
 /** Convenience: assemble + mine in one call. Returns null on the same terms as mineBlock. */
