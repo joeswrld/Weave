@@ -47,12 +47,12 @@
  */
 
 import {
+  activeConsensusAlgorithm,
   compactToTarget,
   computeMerkleRootOfTransactions,
   createCoinbaseTransaction,
   createLockingScript,
   deserializeBlock,
-  getBlockHash,
   getBlockHashHex,
   getBlockRewardSmallestUnits,
   hashMeetsTarget,
@@ -303,8 +303,13 @@ export class MiningPool {
       return { ok: false, reason: "could not deserialize submitted block" };
     }
 
-    // Independently re-hash — never trust a client-supplied hash.
-    const hash: Hash = getBlockHash(header);
+    // Independently re-hash under the network's activeConsensusAlgorithm
+    // (WPoW-V1) — never trust a client-supplied hash. This used to call
+    // plain getBlockHash (SHA-256d) directly, which meant a share/block
+    // that satisfied the pool's own check could still be rejected by
+    // node.acceptLocalBlock's real WPoW-V1 validation below — fixed by
+    // hashing the same way the chain now actually verifies.
+    const hash: Hash = activeConsensusAlgorithm.computeProofHash(header);
 
     if (!hashMeetsTarget(hash, session.shareTarget)) {
       return { ok: false, reason: "share does not meet this session's share target" };
