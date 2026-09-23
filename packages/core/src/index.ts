@@ -17,6 +17,7 @@ export * from "./chain";
 
 // Phase 4 — Mining
 export * from "./difficulty";
+export * from "./consensus";
 
 // Phase 5 — P2P wire protocol (message types + codec) lives in the
 // separate @weave/protocol package, not here: core has no business
