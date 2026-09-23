@@ -1,4 +1,3 @@
-
 /**
  * Pluggable proof-of-work layer (Phase "WPoW").
  *
@@ -21,6 +20,10 @@
  */
 
 import type { BlockHeader } from "../block";
+import type { RetargetInput } from "../difficulty";
+
+/** Re-exported from difficulty.ts (imported above) so callers only importing from ./consensus still get the type — no separate duplicate declaration. */
+export type { RetargetInput };
 
 /**
  * A self-contained, independently-verifiable proof that a given header's
@@ -49,13 +52,6 @@ export interface MineResult {
   proof: ConsensusProof;
   hashesTried: number;
   elapsedMs: number;
-}
-
-/** Same shape difficulty.ts's RetargetInput already uses — re-declared here so this module has no import-cycle back into difficulty.ts. */
-export interface RetargetInput {
-  previousBits: number;
-  firstBlockTimestamp: number;
-  lastBlockTimestamp: number;
 }
 
 /**
