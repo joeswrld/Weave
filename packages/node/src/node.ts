@@ -7,9 +7,9 @@
  */
 import { EventEmitter } from "node:events";
 import {
-  ChainState, UtxoSet, buildGenesisTemplate, compactToTarget, createLockingScript,
-  deserializeTransaction, getBlockHash, getBlockHashHex, getBlockRewardSmallestUnits, getTxIdHex,
-  hashToHex, hashMeetsTarget, parseLockingScript, validateTransaction,
+  ChainState, UtxoSet, activeConsensusAlgorithm, buildGenesisTemplate, createLockingScript,
+  deserializeTransaction, getBlockHashHex, getBlockRewardSmallestUnits, getTxIdHex,
+  hashToHex, parseLockingScript, validateTransaction,
   type Block, type Transaction, type UTXO,
 } from "@weave/core";
 import { addressToPubKeyHash } from "@weave/crypto";
@@ -112,12 +112,11 @@ export class WeaveNode extends EventEmitter {
       genesisPayoutLockingScript: createLockingScript(pkh ?? new Uint8Array(20)),
       rewardSmallestUnits: BigInt(getBlockRewardSmallestUnits(0)),
     });
-    const target = compactToTarget(template.header.difficultyTarget)!;
-    for (let nonce = 0; nonce <= 0xffff_ffff; nonce++) {
-      const header = { ...template.header, nonce };
-      if (hashMeetsTarget(getBlockHash(header), target)) return { header, transactions: template.transactions };
+    const result = activeConsensusAlgorithm.mine(template.header);
+    if (result === null) {
+      throw new Error("could not mine genesis block; lower GENESIS_BITS difficulty");
     }
-    throw new Error("could not mine genesis block; lower GENESIS_BITS difficulty");
+    return { header: result.header, transactions: template.transactions };
   }
 
   /** Restore from disk (full re-validation via ChainState) or start from genesis. */
