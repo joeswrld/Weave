@@ -1,4 +1,16 @@
 /**
+ * CURRENTLY UNUSED — kept for reference, not wired into miner.worker.ts.
+ *
+ * This module implements plain sha256d in WASM. The network's active
+ * consensus algorithm is now WPoW-V1 (scrypt(headerBytes,headerBytes) then
+ * sha256d — see @weave/core's consensus/wpow-v1.ts and consensus/active.ts),
+ * not plain sha256d, so this hasher's search() finds nonces that satisfy
+ * the WRONG proof-of-work and would be rejected by every node's real
+ * validation. Do not import this from miner.worker.ts again until a
+ * genuine WPoW-V1 WASM port (scrypt's memory-hard step included, not just
+ * the sha256d compression at the end) replaces it — see miner.worker.ts's
+ * module doc comment for why that port is deliberately out of scope here.
+ *
  * WASM SHA-256d nonce-search hasher (Phase 8's "compile the hashing routine
  * to WebAssembly for a real speed boost over pure JS").
  *
