@@ -55,8 +55,14 @@ export interface IndexedBlock {
   onBestChain: boolean;
 }
 
-/** work(target) = 2^256 / (target + 1), same definition Bitcoin uses — a lower target is more work. */
-function blockWork(target: bigint): bigint {
+/**
+ * work(target) = 2^256 / (target + 1), same definition Bitcoin uses — a
+ * lower target is more work. Exported (only change made here for the WPoW
+ * work) so consensus/work.ts can reuse this exact definition instead of a
+ * second copy drifting out of sync with it — every ConsensusAlgorithm's
+ * calculateWork ultimately calls this same function.
+ */
+export function blockWork(target: bigint): bigint {
   return (1n << 256n) / (target + 1n);
 }
 
