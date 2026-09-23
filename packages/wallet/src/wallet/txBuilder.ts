@@ -1,4 +1,3 @@
-
 /**
  * Client-side transaction construction and signing (Phase 7/2). Signing
  * happens ONLY here, in the browser, with the in-memory private key from
@@ -10,11 +9,10 @@
  */
 
 import {
-  MIN_FEE_SMALLEST_UNITS,
+  calculateRequiredFee,
   createLockingScript,
   getTxIdHex,
   serializeTransaction,
-  suggestFee,
   type Transaction,
   type TxOutput,
 } from "@weave/core";
@@ -66,10 +64,24 @@ function bytesToHex(bytes: Uint8Array): string {
 
 /**
  * Builds, signs, and serializes a transaction sending `amountSmallestUnits`
- * to `toAddress`. Fee defaults to the network minimum (the wallet's
+ * to `toAddress`.
+ *
+ * totalSenderCost = amountSent + baseFee + priorityFee, where
+ * baseFee = baseFeePerSignature × signatureCount is mandatory (the network
+ * rejects anything paying less — see @weave/core's utxo.ts) and
+ * priorityFee is this wallet's optional, user-chosen amount on top.
+ * `priorityFeeSmallestUnits` defaults to 0 (base fee only — the wallet's
  * "sending WVE costs basically nothing, no decision required" default from
- * the build spec's fee design); pass a larger `feeSmallestUnits` for the
- * advanced fee-bump path.
+ * the build spec's fee design); pass a larger value for the advanced
+ * fee-bump path.
+ *
+ * signatureCount — and so baseFee — isn't known until UTXOs are selected
+ * (one P2PKH input == one signature), so this resolves the same way as fee
+ * size estimation always has here: select once with a single-signature
+ * estimate, compute the REAL base fee once the actual input count is
+ * known, and reselect if that changed how much needs to be covered. The
+ * fee actually committed to the transaction is always recomputed from the
+ * final, real input count — never left as an estimate.
  *
  * Throws if the wallet's UTXOs can't cover amount + fee.
  */
@@ -78,7 +90,7 @@ export function buildAndSignTransaction(params: {
   utxos: UtxoResponse[];
   toAddress: string;
   amountSmallestUnits: bigint;
-  feeSmallestUnits?: bigint;
+  priorityFeeSmallestUnits?: bigint;
 }): BuiltTransaction {
   const { wallet, utxos, toAddress, amountSmallestUnits } = params;
 
@@ -91,13 +103,28 @@ export function buildAndSignTransaction(params: {
 
   if (amountSmallestUnits <= 0n) throw new Error("Amount must be positive.");
 
-  // Fee estimation needs the tx size, which depends on input count, which
-  // depends on the fee (circular) — resolved the standard way: estimate
-  // with a first UTXO selection, then reselect once size is known if it
-  // changed the input count. One extra pass is enough in practice since
-  // P2PKH inputs/outputs are fixed-size.
-  let feeSmallestUnits = params.feeSmallestUnits ?? BigInt(MIN_FEE_SMALLEST_UNITS);
+  const priorityFeeSmallestUnits = params.priorityFeeSmallestUnits ?? 0n;
+  if (priorityFeeSmallestUnits < 0n) throw new Error("Priority fee must not be negative.");
+
+  // Seed with a 1-signature estimate to pick an initial UTXO set, then
+  // recompute the real base fee from however many inputs that actually
+  // took and reselect if the requirement grew (more inputs -> more
+  // signatures -> a bigger required base fee -> possibly more inputs still
+  // needed to cover it). P2PKH inputs are fixed-size, so this converges in
+  // at most one extra pass in practice — same pattern this function
+  // already used for tx-size-based fee estimation below.
+  let feeSmallestUnits = calculateRequiredFee(1, priorityFeeSmallestUnits);
   let selection = selectUtxos(utxos, amountSmallestUnits + feeSmallestUnits);
+
+  const requiredForSelection = calculateRequiredFee(selection.chosen.length, priorityFeeSmallestUnits);
+  if (requiredForSelection !== feeSmallestUnits) {
+    feeSmallestUnits = requiredForSelection;
+    selection = selectUtxos(utxos, amountSmallestUnits + feeSmallestUnits);
+    // One more correction pass in case reselecting changed the input count
+    // again (e.g. crossed a UTXO-count boundary that needs one more input).
+    const requiredAfterReselect = calculateRequiredFee(selection.chosen.length, priorityFeeSmallestUnits);
+    feeSmallestUnits = requiredAfterReselect;
+  }
 
   if (selection.total < amountSmallestUnits + feeSmallestUnits) {
     throw new Error("Insufficient funds to cover amount plus fee.");
@@ -119,21 +146,6 @@ export function buildAndSignTransaction(params: {
       outputs,
     };
   };
-
-  // Estimate size with a placeholder-signed tx to refine the fee if the
-  // caller didn't pin one explicitly (advanced fee-per-byte path).
-  if (params.feeSmallestUnits === undefined) {
-    const draft = buildUnsigned(selection.chosen, feeSmallestUnits);
-    const estimatedSize = serializeTransaction(draft).length + draft.inputs.length * 140; // rough room for sig+pubkey per input
-    const suggested = BigInt(suggestFee(estimatedSize, "normal"));
-    if (suggested > feeSmallestUnits) {
-      feeSmallestUnits = suggested;
-      selection = selectUtxos(utxos, amountSmallestUnits + feeSmallestUnits);
-      if (selection.total < amountSmallestUnits + feeSmallestUnits) {
-        throw new Error("Insufficient funds to cover amount plus fee.");
-      }
-    }
-  }
 
   const unsigned = buildUnsigned(selection.chosen, feeSmallestUnits);
 
