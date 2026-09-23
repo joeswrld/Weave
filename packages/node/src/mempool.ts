@@ -6,10 +6,12 @@
  * Holds pending, not-yet-mined transactions and prioritizes them for block
  * assembly by fee rate (fee / byte), same approach as Bitcoin's mempool.
  * This is node-local policy, not consensus: different nodes may order
- * their mempools differently, as long as every node still enforces
- * MIN_FEE_SMALLEST_UNITS — that part IS consensus (@weave/core's fees.ts
- * and, more precisely, utxo.ts's validateTransaction, which is the actual
- * authority on whether a transaction may ever be mined at all).
+ * their mempools differently, as long as every node still enforces the
+ * required base fee (baseFeePerSignature × signatureCount) — that part IS
+ * consensus (@weave/core's fees.ts and, more precisely, utxo.ts's
+ * validateTransaction, which is the actual authority on whether a
+ * transaction may ever be mined at all; this mempool's own check below is
+ * a cheap early-reject mirror of that same rule, not a separate policy).
  *
  * The mempool deliberately has no UTXO set access of its own — computing a
  * transaction's fee needs the value of whatever it spends, which only the
@@ -20,7 +22,7 @@
  * given fee — see the build spec's "Decentralization model".
  */
 
-import { MIN_FEE_SMALLEST_UNITS, getTxIdHex, serializeTransaction, type Transaction } from "@weave/core";
+import { calculateBaseFee, countSignatures, getTxIdHex, meetsRequiredFee, serializeTransaction, type Transaction } from "@weave/core";
 
 interface MempoolEntry {
   transaction: Transaction;
@@ -29,16 +31,16 @@ interface MempoolEntry {
   addedAt: number; // ms epoch, used as a tie-breaker
 }
 
-const MIN_FEE = BigInt(MIN_FEE_SMALLEST_UNITS);
-
 export class Mempool {
   private readonly entries = new Map<string, MempoolEntry>();
 
   add(transaction: Transaction, feeSmallestUnits: bigint): { accepted: boolean; reason?: string } {
-    if (feeSmallestUnits < MIN_FEE) {
+    const signatureCount = countSignatures(transaction);
+    if (!meetsRequiredFee(feeSmallestUnits, signatureCount)) {
+      const required = calculateBaseFee(signatureCount);
       return {
         accepted: false,
-        reason: `fee ${feeSmallestUnits} below network minimum ${MIN_FEE_SMALLEST_UNITS}`,
+        reason: `fee ${feeSmallestUnits} below required base fee ${required} for ${signatureCount} signature(s)`,
       };
     }
 
