@@ -1,10 +1,30 @@
 /**
  * Nonce-search loop for one mining worker (Phase 8). Runs off the main
- * thread so hashing never blocks the UI. Tries the WASM SHA-256d hasher
- * (wasmHasher.ts) first for a real speed boost over pure JS, falling back
- * to a pure-JS @weave/core loop (which itself wraps @noble/hashes) if WASM
- * isn't available or fails to load — mining still works either way, just
- * slower without WASM.
+ * thread so hashing never blocks the UI.
+ *
+ * CONCRETE BUG FIXED HERE: this worker used to try wasmHasher.ts's
+ * compiled-WASM hasher first, falling back to pure JS only if WASM was
+ * unavailable. That WASM module implements plain sha256d — it predates,
+ * and does not implement, WPoW-V1 (scrypt(headerBytes,headerBytes) then
+ * sha256d — see @weave/core's consensus/wpow-v1.ts), which is now the
+ * network's activeConsensusAlgorithm (consensus/active.ts) that
+ * checkProofOfWork/ChainState actually enforce (see utxo.ts). A browser
+ * miner using the old WASM path was therefore silently searching for
+ * sha256d-valid nonces that the real chain would reject as invalid
+ * WPoW-V1 proofs — every "found!" from that path was a guaranteed
+ * rejected submission.
+ *
+ * The WASM path is disabled below (loadWasmHasher is never called) until
+ * a WPoW-V1 WASM port exists (build order: "WPoW → WASM" is its own
+ * phase, not a mechanical fix to fold into this bug fix — scrypt's
+ * variable-size memory-hard scratch buffer is a materially different
+ * WASM module than a fixed-size sha256d compression loop, and hand-
+ * writing/verifying that correctly deserves its own dedicated pass and
+ * tests rather than a rushed edit to a hand-written .wat blob here).
+ * Every worker now always takes the pure-JS loop below, which already
+ * calls @weave/core's real activeConsensusAlgorithm and therefore
+ * produces proofs the chain actually accepts. hashMode is now always
+ * "js" until that WASM port lands.
  *
  * Protocol (postMessage):
  *
@@ -20,8 +40,7 @@
  * informational, doesn't affect correctness.
  */
 
-import { getBlockHashHex, hashMeetsTarget, hashToBigInt, serializeHeader, type BlockHeader } from "@weave/core";
-import { loadWasmHasher } from "./wasmHasher";
+import { activeConsensusAlgorithm, hashMeetsTarget, hashToBigInt, type BlockHeader } from "@weave/core";
 
 interface WorkMessage {
   type: "work";
@@ -56,11 +75,6 @@ function hexToBytes(hex: string): Uint8Array {
   return out;
 }
 
-// Loaded once per worker and reused for every "work" message — instantiating
-// the WASM module on every candidate would be wasteful and pointless since
-// the module itself carries no per-candidate state.
-const hasherPromise = loadWasmHasher();
-
 self.onmessage = (event: MessageEvent<InMessage>) => {
   const msg = event.data;
   generation += 1;
@@ -72,86 +86,27 @@ async function runSearch(work: WorkMessage, myGeneration: number): Promise<void>
   const prevHash = hexToBytes(work.header.prevHashHex);
   const merkleRoot = hexToBytes(work.header.merkleRootHex);
 
-  const wasm = await hasherPromise;
-  if (myGeneration !== generation) return; // superseded while WASM was loading
-
   let nonce = work.nonceStart;
   let hashesThisWindow = 0;
   let windowStart = performance.now();
 
-  if (wasm) {
-    // The 80-byte header is fixed for this whole candidate except its last
-    // 4 bytes (the nonce), which the WASM module itself overwrites on every
-    // attempt (see wasmHasher.ts's memory-layout doc comment) — built once
-    // here rather than per-nonce.
-    const headerBytes = serializeHeader({
-      version: work.header.version,
-      prevHash,
-      merkleRoot,
-      timestamp: work.header.timestamp,
-      difficultyTarget: work.header.difficultyTarget,
-      nonce: 0,
-    });
-
-    // Much larger than the JS batch size below: WASM does a batch's worth
-    // of hashing synchronously inside one call, so the batch size is what
-    // controls how long we go between yields back to the event loop (for
-    // "stop" responsiveness and hashrate reporting) — orders of magnitude
-    // faster per-hash than JS means this needs to be orders of magnitude
-    // bigger to land in a similar wall-clock window per batch.
-    const WASM_BATCH = 300_000;
-
-    const step = () => {
-      if (myGeneration !== generation) return;
-
-      const batchEnd = Math.min(nonce + WASM_BATCH, work.nonceEnd);
-      const result = wasm.search(headerBytes, work.targetHex, nonce, batchEnd);
-      hashesThisWindow += batchEnd - nonce;
-      nonce = batchEnd;
-
-      if (result) {
-        (self as unknown as Worker).postMessage({ type: "found", nonce: result.nonce, hash: result.hashHex });
-        return;
-      }
-
-      const now = performance.now();
-      if (now - windowStart >= HASHRATE_REPORT_INTERVAL_MS) {
-        const hashesPerSecond = (hashesThisWindow / (now - windowStart)) * 1000;
-        (self as unknown as Worker).postMessage({
-          type: "hashrate",
-          workerIndex: work.workerIndex,
-          hashesPerSecond,
-          hashMode: "wasm",
-        });
-        hashesThisWindow = 0;
-        windowStart = now;
-      }
-
-      if (nonce >= work.nonceEnd) {
-        (self as unknown as Worker).postMessage({ type: "exhausted", workerIndex: work.workerIndex });
-        return;
-      }
-
-      setTimeout(step, 0);
-    };
-
-    step();
-    return;
-  }
-
-  // Pure-JS fallback: no WASM available (WebAssembly missing, or the
-  // module failed to instantiate) — same nonce-search, just hashing one
-  // header at a time via @weave/core instead of the batched WASM call.
+  // activeConsensusAlgorithm.computeProofHash (WPoW-V1: scrypt then
+  // sha256d — see @weave/core's consensus/wpow-v1.ts) is what the chain
+  // actually verifies against, so that's what this loop must search
+  // with. Small batches so a "stop" (or superseding "work") message
+  // posted from the main thread is actually seen promptly — a tight
+  // synchronous loop over the whole nonce range would never yield, and
+  // "Start mining" -> "Stop mining" would feel frozen. Batch size is
+  // deliberately small: WPoW-V1's scrypt step is far more expensive per
+  // attempt than plain sha256d was, so even a modest batch already takes
+  // noticeably longer wall-clock time between yields.
   const target = BigInt("0x" + work.targetHex);
+  const BATCH = 200;
 
   const step = () => {
     if (myGeneration !== generation) return;
 
-    // Small batches so a "stop" (or superseding "work") message posted
-    // from the main thread is actually seen promptly — a tight
-    // synchronous loop over the whole nonce range would never yield, and
-    // "Start mining" -> "Stop mining" would feel frozen.
-    const batchEnd = Math.min(nonce + 2000, work.nonceEnd);
+    const batchEnd = Math.min(nonce + BATCH, work.nonceEnd);
     for (; nonce < batchEnd; nonce++) {
       const header: BlockHeader = {
         version: work.header.version,
@@ -161,10 +116,11 @@ async function runSearch(work: WorkMessage, myGeneration: number): Promise<void>
         difficultyTarget: work.header.difficultyTarget,
         nonce,
       };
-      const hashHex = getBlockHashHex(header);
+      const hash = activeConsensusAlgorithm.computeProofHash(header);
       hashesThisWindow++;
 
-      if (hashMeetsTarget(hexToBytes(hashHex), target)) {
+      if (hashMeetsTarget(hash, target)) {
+        const hashHex = Array.from(hash, (b) => b.toString(16).padStart(2, "0")).join("");
         (self as unknown as Worker).postMessage({ type: "found", nonce, hash: hashHex });
         return;
       }
