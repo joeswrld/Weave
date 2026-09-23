@@ -3,11 +3,12 @@
  * ...
  */
 
-import { checkBlockStructure, getBlockHash, type Block, type BlockHeader } from "./block";
+import { checkBlockStructure, type Block, type BlockHeader } from "./block";
+import { activeConsensusAlgorithm } from "./consensus/active";
+import { checkProofOfWorkWith } from "./consensus/validate";
 import { getBlockRewardSmallestUnits } from "./consensus-params";
 import { hashesEqual, hashToHex, type Hash } from "./hash";
 import { checkScriptsStructure } from "./script";
-import { compactToTarget, hashMeetsTarget } from "./target";
 import {
   checkTransactionStructure,
   getCoinbaseHeight,
@@ -194,12 +195,15 @@ export type SignatureVerifier = (tx: Transaction, inputIndex: number, prevLockin
 let verifyInputSignature: SignatureVerifier = () => false; // fail closed
 export function setSignatureVerifier(verifier: SignatureVerifier): void { verifyInputSignature = verifier; }
 
+/**
+ * Delegates to consensus/validate.ts's checkProofOfWorkWith, fixed to the
+ * network's activeConsensusAlgorithm (see consensus/active.ts), rather than
+ * hardcoding SHA-256d. Recomputes the proof hash from `header` itself every
+ * time via verifyProof — never trusts a caller-supplied hash — exactly like
+ * the plain-SHA-256d check this replaced.
+ */
 export function checkProofOfWork(header: BlockHeader): string | null {
-  const target = compactToTarget(header.difficultyTarget);
-  if (target === null) return "invalid difficultyTarget encoding";
-  const hash = getBlockHash(header);
-  if (!hashMeetsTarget(hash, target)) return `block hash ${hashToHex(hash)} does not meet target`;
-  return null;
+  return checkProofOfWorkWith(header, activeConsensusAlgorithm);
 }
 
 export function validateBlock(block: Block, utxoSet: UtxoSet, context: BlockContext): BlockValidationResult {
