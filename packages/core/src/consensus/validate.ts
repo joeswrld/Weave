@@ -1,15 +1,13 @@
 /**
  * Block-header proof-of-work validation, generalized over ConsensusAlgorithm.
  *
- * This mirrors utxo.ts's existing checkProofOfWork (same "return null if OK,
- * else a reason string" convention used throughout block.ts/utxo.ts) but
- * takes the algorithm as a parameter instead of hard-coding SHA-256d. It
- * does NOT replace checkProofOfWork or get wired into ChainState/
- * validateBlock — the live chain keeps using exactly the validation path it
- * already used before this task. This function is the integration point a
- * future change could call from there, once a network is actually ready to
- * run something other than plain SHA-256d; wiring that in is deliberately
- * out of scope here (see the module doc comment in types.ts).
+ * utxo.ts's checkProofOfWork (used by ChainState/validateBlock, and
+ * therefore by every real block the chain accepts) now IS a thin wrapper
+ * around this function, fixed to consensus/active.ts's
+ * activeConsensusAlgorithm — same "return null if OK, else a reason
+ * string" convention used throughout block.ts/utxo.ts, just generalized
+ * over which algorithm produced/checks the proof instead of hard-coding
+ * SHA-256d.
  */
 
 import { compactToTarget } from "../target";
