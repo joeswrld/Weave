@@ -40,11 +40,14 @@ export interface MinerStatus {
   blocksFound: number;
   lastResult: { accepted: boolean; hash?: string; reason?: string; wasShare?: boolean } | null;
   lastError: string | null;
-  /** Big-endian hex target the workers are actually searching against
-   *  right now — the real network target in solo mode, the (easier) share
-   *  target in pool mode — so the UI can derive a network-hashrate / ETA
-   *  estimate (see lib/format.ts's estimateNetworkHashrate) without a
-   *  separate API call. */
+  /** Big-endian hex of the *real network* difficulty target for the
+   *  current candidate — always this, never the easier pool share target,
+   *  so the UI's network-hashrate / ETA estimate (see lib/format.ts's
+   *  estimateNetworkHashrate) reflects the actual network in both solo and
+   *  pool mode rather than the much-easier-to-hit share target. Workers
+   *  themselves search against currentShareTarget (which equals this in
+   *  solo mode); this field is purely for the UI estimate, not for mining
+   *  itself. */
   currentTargetHex: string | null;
   /** Whether at least one worker reported using the WASM hasher vs. the
    *  pure-JS fallback — purely informational (see miner.worker.ts). */
@@ -100,7 +103,7 @@ export class MinerPool {
       blocksFound: this.blocksFound,
       lastResult: this.lastResult,
       lastError: this.lastError,
-      currentTargetHex: this.mode === "pool" ? this.currentShareTarget : this.currentTargetHex,
+      currentTargetHex: this.currentTargetHex,
       hashMode: this.hashMode,
       poolStatus: this.poolStatus,
     };
