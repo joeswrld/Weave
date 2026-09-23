@@ -7,10 +7,12 @@ import { checkBlockStructure, type Block, type BlockHeader } from "./block";
 import { activeConsensusAlgorithm } from "./consensus/active";
 import { checkProofOfWorkWith } from "./consensus/validate";
 import { getBlockRewardSmallestUnits } from "./consensus-params";
+import { calculateBaseFee, meetsRequiredFee } from "./fees";
 import { hashesEqual, hashToHex, type Hash } from "./hash";
 import { checkScriptsStructure } from "./script";
 import {
   checkTransactionStructure,
+  countSignatures,
   getCoinbaseHeight,
   getTxId,
   isCoinbase,
@@ -187,7 +189,25 @@ export function validateTransaction(
     return invalid(`sum(inputs) ${totalInput} < sum(outputs) ${totalOutput} — transaction would create WVE from nothing`);
   }
 
-  return { valid: true, totalInput, totalOutput, fee: totalInput - totalOutput };
+  const fee = totalInput - totalOutput;
+
+  // Fee is consensus, not just relay policy: every node MUST independently
+  // recompute the required base fee (baseFeePerSignature × signatureCount)
+  // from the transaction itself and reject anything that underpays it —
+  // never trust a claimed fee, whether from a peer relaying the tx or from
+  // whatever a block's coinbase later claims to have collected (see
+  // validateBlock below, which sums exactly these independently-verified
+  // fees rather than any value the block itself asserts).
+  const signatureCount = countSignatures(tx);
+  if (!meetsRequiredFee(fee, signatureCount)) {
+    const required = calculateBaseFee(signatureCount);
+    return invalid(
+      `fee ${fee} is below the required base fee ${required} for ${signatureCount} signature(s) ` +
+        `(sum(inputs) ${totalInput} - sum(outputs) ${totalOutput})`,
+    );
+  }
+
+  return { valid: true, totalInput, totalOutput, fee };
 }
 
 // Signature verification is injected — core has no secp256k1 dependency.
@@ -232,6 +252,12 @@ export function validateBlock(block: Block, utxoSet: UtxoSet, context: BlockCont
     totalFees += result.fee!;
   }
 
+  // minerReward = blockSubsidy + totalTransactionFees. totalFees here is
+  // summed entirely from this node's own independent re-validation of each
+  // transaction above (each already enforcing its own required base fee in
+  // validateTransaction) — never from anything the block or its coinbase
+  // claims. A coinbase paying more than that is rejected outright; paying
+  // less is allowed (a miner may donate/burn part of what it earned).
   const coinbaseReward = coinbaseOutputTotal(coinbaseTx!);
   const expectedReward = BigInt(getBlockRewardSmallestUnits(context.height)) + totalFees;
   if (coinbaseReward > expectedReward) {
