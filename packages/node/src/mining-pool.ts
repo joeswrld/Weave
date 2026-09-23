@@ -1,538 +1,368 @@
 /**
- * Weave mining pool (Phase 8): lets many browser tabs mine together and
- * split a block's reward by how much work each contributed, since any one
- * tab is very unlikely to find a block alone at real network difficulty
- * (see the build spec's Phase 8 notes).
+ * Coordinates a pool of miner.worker.ts instances against a node's Phase 8
+ * mining API. Scales worker count to navigator.hardwareConcurrency by
+ * default, splits the 32-bit nonce space evenly across them, and re-fetches
+ * work whenever the chain tip moves (a new block from anyone invalidates
+ * the current candidate) or a worker exhausts its assigned nonce range
+ * without finding one.
  *
- * How it works, in the same spirit as a real pool (Stratum-style, just
- * over REST here instead of a custom binary protocol):
+ * Two modes, chosen by the caller (see MiningPanel's mode toggle):
+ *   - "solo": talks to /api/getwork + /api/submitblock. Workers search
+ *     against the real network target; a find pays this address alone.
+ *     Realistic for solo miners only at very low network difficulty.
+ *   - "pool": talks to /api/pool/getwork + /api/pool/submitshare, which
+ *     hand out and check a much easier "share target" (see the node's
+ *     mining-pool.ts). Most finds are just shares (credited work, no
+ *     payout yet); occasionally one also clears the real network target
+ *     and the pool submits it as a block, paying every contributor of the
+ *     current round proportionally. This is the practical way for a
+ *     single browser tab to see *any* return before real-world difficulty
+ *     makes solo mining a lottery with a vanishingly small ticket.
  *
- *  - The pool hands out work at an easier "share target" than the real
- *    network target — easy enough that a browser tab finds a share every
- *    few seconds to minutes instead of almost never. A share is proof the
- *    miner actually did work: its hash must be below the share target,
- *    the same PoW check as a real block, just against a looser bar.
- *  - The pool credits each submitting address with "difficulty-weighted"
- *    work for every valid share — 1 share at target difficulty D counts
- *    as D units of work, so a round mixing different share targets (see
- *    `maybeRetargetSession` below) still splits fairly.
- *  - Every candidate handed out by getWork already carries a coinbase that
- *    pays every contributor in the current round proportionally to their
- *    accumulated work (using @weave/core's multi-output coinbase support
- *    — see transaction.ts's createCoinbaseTransaction doc comment: "a
- *    mining pool can pay several participants directly in the coinbase").
- *    This has to be decided before a miner starts searching nonces, not
- *    after: the coinbase is committed to by the header's merkle root, so
- *    changing it after the fact would change the block hash and silently
- *    invalidate whatever nonce was found. Every so often, a share that
- *    happens to ALSO beat the *real* network target is a genuine block —
- *    the pool submits the (already-final) candidate to the node like any
- *    other block and starts a fresh round.
- *  - This class never trusts a miner's own claim about how much work it
- *    did — every share is independently re-hashed and PoW-checked here
- *    before being credited, same "never trust the peer, verify" spirit as
- *    the rest of Weave's consensus code (see the build spec's
- *    decentralization model). The only thing NOT independently
- *    re-verified per the network's own consensus rules is the *payout
- *    split itself* — that's pool policy, not consensus; the resulting
- *    block is still fully re-validated by every node (including this one,
- *    via WeaveNode.acceptLocalBlock) exactly like any other block.
- *
- * Deliberately simple accounting: this is "proportional, current round"
- * (work resets to zero after each pool block is found), not a
- * PPLNS/variance-smoothing scheme — a reasonable first version per the
- * build spec's "consider a simple pool that splits by contributed work"
- * framing, without the extra complexity real pools add to reduce miners'
- * payout variance across rounds.
+ * This class owns *when* to fetch work and what to do with a found nonce;
+ * it does not do any hashing itself (that's the workers) and does not
+ * decide whether a submitted block/share was actually accepted (that's
+ * the node — this class just reports what the node said).
  */
 
-import {
-  compactToTarget,
-  computeMerkleRootOfTransactions,
-  createCoinbaseTransaction,
-  createLockingScript,
-  deserializeBlock,
-  getBlockHash,
-  getBlockHashHex,
-  getBlockRewardSmallestUnits,
-  hashMeetsTarget,
-  hashToHex,
-  serializeBlock,
-  type Block,
-  type BlockHeader,
-  type Hash,
-} from "@weave/core";
-import { addressToPubKeyHash } from "@weave/crypto";
-import type { WeaveNode } from "./node";
-import { assembleCandidateBlock } from "./miner";
+import type { GetWorkResponse, PoolGetWorkResponse, PoolStatusResponse, RestClient } from "../api/restClient";
 
-const MAX_TARGET = (1n << 256n) - 1n;
+export type MiningMode = "solo" | "pool";
 
-/** Minimum coinbase payout, in smallest units, below which a contributor
- *  is folded into the next round instead of getting a dust-sized output —
- *  mirrors real pools' payout-threshold behavior and keeps the coinbase
- *  transaction from bloating with near-zero outputs when many tabs
- *  contribute trivial amounts of work. */
-const MIN_PAYOUT_SMALLEST_UNITS = 1_000n; // 0.00001 WVE
-
-/** How much easier the starting share target is than the network target.
- *  2^12 = 4096x easier — tuned so a single browser tab (order of 10^5-10^6
- *  H/s, per the build spec's own hashrate expectations) finds a share
- *  roughly every few seconds to tens of seconds, frequent enough to feel
- *  responsive and to make payout splitting meaningfully fair, without
- *  flooding the pool with share-submission HTTP requests. */
-const INITIAL_SHARE_TARGET_MULTIPLIER = 1n << 12n;
-
-/** Per-session share-target retargeting bounds, same idea as Bitcoin/
- *  Weave's own block-difficulty retargeting (difficulty.ts) but applied
- *  per-miner-session instead of network-wide: if a session is finding
- *  shares much faster or slower than the target rate, adjust its personal
- *  share target so submission frequency stays in a sane band regardless
- *  of how many workers / what hashrate that particular tab has. */
-const TARGET_SHARE_INTERVAL_MS = 8_000;
-const RETARGET_MIN_SHARES = 8; // don't retarget on too little data
-const MAX_SHARE_RETARGET_FACTOR = 4;
-
-function hexToBytes(hex: string): Uint8Array {
-  const out = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
-  return out;
+export interface MinerStatus {
+  running: boolean;
+  mode: MiningMode;
+  hashesPerSecond: number;
+  workerCount: number;
+  /** Solo mode: full blocks this session found and had accepted. Pool
+   *  mode: shares this session found (see poolStatus for pool-wide block
+   *  finds, which aren't attributable to one session in the UI). */
+  blocksFound: number;
+  lastResult: { accepted: boolean; hash?: string; reason?: string; wasShare?: boolean } | null;
+  lastError: string | null;
+  /** Big-endian hex of the *real network* difficulty target for the
+   *  current candidate — always this, never the easier pool share target,
+   *  so the UI's network-hashrate / ETA estimate (see lib/format.ts's
+   *  estimateNetworkHashrate) reflects the actual network in both solo and
+   *  pool mode rather than the much-easier-to-hit share target. Workers
+   *  themselves search against currentShareTarget (which equals this in
+   *  solo mode); this field is purely for the UI estimate, not for mining
+   *  itself. */
+  currentTargetHex: string | null;
+  /** Whether at least one worker reported using the WASM hasher vs. the
+   *  pure-JS fallback — purely informational (see miner.worker.ts). */
+  hashMode: "wasm" | "js" | null;
+  /** Pool mode only: the current round's contributors and this session's
+   *  share of it, polled from /api/pool/status. Null in solo mode or
+   *  before the first poll completes. */
+  poolStatus: PoolStatusResponse | null;
 }
 
-interface Session {
-  addressHex: string; // hex(pubKeyHash), used as the map key
-  shareTarget: bigint;
-  recentShareTimestamps: number[]; // ms epoch, capped, for retargeting
-  lastSeenAt: number;
-}
+type Listener = (status: MinerStatus) => void;
 
-export interface RoundContributor {
-  addressHex: string;
-  /** Sum of (share target's implied difficulty) across every valid share
-   *  this address submitted in the current round — the "weight" used to
-   *  split the eventual block reward. */
-  workUnits: number; // number, not bigint: see WORK_UNIT_SCALE below
-  shareCount: number;
-}
+const NONCE_SPACE = 0x1_0000_0000; // 2^32, full u32 nonce range
+const POOL_STATUS_POLL_MS = 5000;
 
-export interface PoolStatus {
-  active: boolean;
-  round: {
-    contributors: { addressHex: string; workUnits: number; shareCount: number; sharePct: number }[];
-    totalWorkUnits: number;
-    startedAt: number;
-  };
-  poolBlocksFound: number;
-  sessionCount: number;
-}
+export class MinerPool {
+  private workers: Worker[] = [];
+  private perWorkerHashrate: number[] = [];
+  private running = false;
+  private blocksFound = 0;
+  private lastResult: MinerStatus["lastResult"] = null;
+  private lastError: string | null = null;
+  private currentWorkVersion = 0;
+  private currentTargetHex: string | null = null;
+  private currentShareTarget: string | null = null; // pool mode: what workers actually search against
+  private hashMode: MinerStatus["hashMode"] = null;
+  private currentBlockHex: string | null = null;
+  private poolStatus: PoolStatusResponse | null = null;
+  private refetchTimer: ReturnType<typeof setTimeout> | null = null;
+  private poolPollTimer: ReturnType<typeof setInterval> | null = null;
+  private poolWorkRefreshTimer: ReturnType<typeof setInterval> | null = null;
+  private readonly listeners = new Set<Listener>();
 
-export interface SubmitShareResult {
-  ok: boolean;
-  reason?: string;
-  /** True if this share also cleared the real network target — i.e. it
-   *  was itself a full block, which the pool then submitted on the
-   *  session's behalf. */
-  wasBlock?: boolean;
-  blockHash?: string;
-  blockAccepted?: boolean;
-  blockRejectReason?: string;
-  /** The session's new share target (hex), if this share triggered a
-   *  per-session retarget — lets the client adjust without a fresh
-   *  getwork round-trip. */
-  newShareTargetHex?: string;
-}
+  constructor(
+    private readonly rest: RestClient,
+    private readonly payoutAddress: string,
+    private workerCount: number = Math.max(1, Math.min(navigator.hardwareConcurrency || 2, 8)),
+    private mode: MiningMode = "pool",
+  ) {}
 
-/**
- * `workUnits` is difficulty expressed as (maxTarget / shareTarget), scaled
- * down so it fits comfortably in a JS `number` without precision loss for
- * any realistic session count — see creditShare's comment for the exact
- * conversion. bigint math is used for anything consensus/hash-comparison
- * related; plain numbers are fine for "how big a slice of the payout pie"
- * since that only needs a handful of significant digits, not exactness.
- */
-const WORK_UNIT_SCALE = 1e12;
-
-export class MiningPool {
-  private readonly sessions = new Map<string, Session>(); // key: addressHex
-  private round = new Map<string, RoundContributor>(); // key: addressHex
-  private roundStartedAt = Date.now();
-  private poolBlocksFound = 0;
-  private active = false;
-
-  constructor(private readonly node: WeaveNode) {}
-
-  get isActive(): boolean {
-    return this.active;
+  onStatus(fn: Listener): () => void {
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
   }
 
-  start(): void {
-    this.active = true;
+  private emit(): void {
+    const total = this.perWorkerHashrate.reduce((a, b) => a + b, 0);
+    const status: MinerStatus = {
+      running: this.running,
+      mode: this.mode,
+      hashesPerSecond: total,
+      workerCount: this.workerCount,
+      blocksFound: this.blocksFound,
+      lastResult: this.lastResult,
+      lastError: this.lastError,
+      currentTargetHex: this.currentTargetHex,
+      hashMode: this.hashMode,
+      poolStatus: this.poolStatus,
+    };
+    for (const fn of this.listeners) fn(status);
+  }
+
+  setWorkerCount(count: number): void {
+    this.workerCount = Math.max(1, count);
+    if (this.running) {
+      this.stop();
+      void this.start();
+    }
+  }
+
+  /** Switches between solo and pool mining. Restarts if currently running,
+   *  same as changing the worker count — a mode change means a whole new
+   *  candidate/target shape, not something to patch in place. */
+  setMode(mode: MiningMode): void {
+    if (mode === this.mode) return;
+    this.mode = mode;
+    if (this.running) {
+      this.stop();
+      void this.start();
+    }
+  }
+
+  async start(): Promise<void> {
+    if (this.running) return;
+    this.running = true;
+    this.lastError = null;
+    this.perWorkerHashrate = new Array(this.workerCount).fill(0);
+
+    for (let i = 0; i < this.workerCount; i++) {
+      const worker = new Worker(new URL("./miner.worker.ts", import.meta.url), { type: "module" });
+      worker.onmessage = (event) => this.handleWorkerMessage(i, event.data);
+      worker.onerror = (event) => {
+        this.lastError = event.message || "Mining worker error.";
+        this.emit();
+      };
+      this.workers.push(worker);
+    }
+
+    if (this.mode === "pool") {
+      void this.pollPoolStatus();
+      this.poolPollTimer = setInterval(() => void this.pollPoolStatus(), POOL_STATUS_POLL_MS);
+      // The candidate this session searches has its payout coinbase frozen
+      // at the getWork call that issued it (see mining-pool.ts's getWork
+      // doc comment — the split can't change once nonce search starts).
+      // Without this, a session can keep mining one candidate — built from
+      // whatever the round looked like at that one moment, sometimes an
+      // empty/single-payee round right after a reset — for as long as
+      // nonce exhaustion takes, silently excluding every share (this
+      // session's own, and every other session's) credited after that
+      // candidate was issued. Re-fetching on the same cadence as the
+      // status poll keeps that staleness window to a few seconds instead.
+      this.poolWorkRefreshTimer = setInterval(() => void this.fetchAndDispatchWork(), POOL_STATUS_POLL_MS);
+    }
+
+    this.emit();
+    await this.fetchAndDispatchWork();
   }
 
   stop(): void {
-    this.active = false;
-    this.sessions.clear();
+    this.running = false;
+    if (this.refetchTimer) {
+      clearTimeout(this.refetchTimer);
+      this.refetchTimer = null;
+    }
+    if (this.poolPollTimer) {
+      clearInterval(this.poolPollTimer);
+      this.poolPollTimer = null;
+    }
+    if (this.poolWorkRefreshTimer) {
+      clearInterval(this.poolWorkRefreshTimer);
+      this.poolWorkRefreshTimer = null;
+    }
+    for (const w of this.workers) {
+      w.postMessage({ type: "stop" });
+      w.terminate();
+    }
+    this.workers = [];
+    this.perWorkerHashrate = [];
+    this.currentTargetHex = null;
+    this.currentShareTarget = null;
+    this.hashMode = null;
+    this.poolStatus = null;
+    this.emit();
   }
 
-  // --------------------------------------------------------------- getwork
-
-  /**
-   * Hands out a candidate block for `address` to mine against, same shape
-   * as the solo getwork response plus a `shareTarget` the client should
-   * actually search against (easier than `target`, which remains the real
-   * network target for reference/UI purposes only). Creates or reuses this
-   * address's session so its personal share target can adapt over time
-   * (see maybeRetargetSession).
-   *
-   * The coinbase handed out here already pays the *whole current round*
-   * proportionally (see buildRoundCoinbase) — not just `address` — because
-   * the coinbase is part of what the miner's nonce search commits to via
-   * the merkle root. Swapping it for a different coinbase after a nonce is
-   * found would change the merkle root and therefore the block hash,
-   * silently invalidating whatever nonce was found (the hash the miner
-   * searched for would no longer be the hash the new header actually
-   * produces). So the payout must be finalized before work goes out, not
-   * after a share comes back.
-   */
-  getWork(address: string) {
-    const pkh = addressToPubKeyHash(address);
-    if (!pkh) return { error: "invalid address" as const };
-    const addressHex = Buffer.from(pkh).toString("hex");
-
-    let session = this.sessions.get(addressHex);
-    if (!session) {
-      const networkTarget = compactToTarget(this.node.chain.nextDifficultyBits()) ?? MAX_TARGET;
-      const initialShareTarget = clampTarget(networkTarget * INITIAL_SHARE_TARGET_MULTIPLIER);
-      session = {
-        addressHex,
-        shareTarget: initialShareTarget,
-        recentShareTimestamps: [],
-        lastSeenAt: Date.now(),
-      };
-      this.sessions.set(addressHex, session);
-    }
-    session.lastSeenAt = Date.now();
-
-    const tip = this.node.chain.tip;
-    const networkDifficultyBits = this.node.chain.nextDifficultyBits();
-    const networkTarget = compactToTarget(networkDifficultyBits) ?? MAX_TARGET;
-    // Never hand out a share target easier than the network target itself
-    // — that would make "share" and "block" the same thing and defeat the
-    // point of a lower-difficulty accounting target.
-    const shareTarget = session.shareTarget > networkTarget ? session.shareTarget : networkTarget;
-
-    const extra = Buffer.alloc(4);
-    extra.writeUInt32BE(Math.floor(Math.random() * 0xffff_ffff));
-
-    // Build with a single-payee placeholder first just to learn this
-    // candidate's fee total (assembleCandidateBlock computes that against
-    // the actual mempool selection for this height/timestamp), then
-    // replace the coinbase with the full round's proportional payout
-    // before it's ever handed to a miner — see this method's doc comment
-    // for why that has to happen now and not in submitShare.
-    const { block: draft, totalFees } = assembleCandidateBlock({
-      height: tip.height + 1,
-      prevHash: tip.hash,
-      difficultyTarget: networkDifficultyBits,
-      payoutLockingScript: createLockingScript(pkh),
-      mempool: this.node.mempool,
-      coinbaseExtraData: new Uint8Array(extra),
-      timestamp: Math.max(Math.floor(Date.now() / 1000), tip.block.header.timestamp + 1),
-    });
-    const block = this.buildRoundCoinbase(draft, tip.height + 1, totalFees, pkh);
-
-    return {
-      height: tip.height + 1,
-      prevHash: tip.hashHex,
-      difficultyBits: networkDifficultyBits,
-      target: networkTarget.toString(16).padStart(64, "0"),
-      shareTarget: shareTarget.toString(16).padStart(64, "0"),
-      header: {
-        ...block.header,
-        prevHash: hashToHex(block.header.prevHash),
-        merkleRoot: hashToHex(block.header.merkleRoot),
-      },
-      blockHex: Buffer.from(serializeBlock(block)).toString("hex"),
-      totalFees: totalFees.toString(),
-    };
+  /** Call when the wallet's live feed reports a new block from anyone —
+   * the current candidate's prevHash is now stale. */
+  notifyNewTip(): void {
+    if (this.running) void this.fetchAndDispatchWork();
   }
 
-  // ----------------------------------------------------------- submitShare
-
-  /**
-   * Validates a submitted share: re-derives the block from the submitted
-   * `blockHex` + `nonce`, independently re-hashes the header (never trusts
-   * the miner's own claimed hash), and checks it against that session's
-   * share target. Credits work on success. If the share also beats the
-   * real network target, treats it as a found block: builds the
-   * round-payout coinbase, submits it via the node's normal
-   * acceptLocalBlock path (which re-validates it exactly like any other
-   * block — see this file's header comment), and starts a new round.
-   */
-  submitShare(address: string, blockHex: string, nonce: number): SubmitShareResult {
-    if (!this.active) return { ok: false, reason: "pool is not active" };
-    const pkh = addressToPubKeyHash(address);
-    if (!pkh) return { ok: false, reason: "invalid address" };
-    const addressHex = Buffer.from(pkh).toString("hex");
-    const session = this.sessions.get(addressHex);
-    if (!session) return { ok: false, reason: "no active session for this address — call getwork first" };
-    // A share is just as much a sign of life as a getWork call — sessions
-    // that mine steadily on one long-lived candidate (no exhaustion, no new
-    // tip) may go many minutes between getWork calls while still actively
-    // submitting shares; only bumping lastSeenAt in getWork would let
-    // pruneIdleSessions evict a perfectly active miner mid-round, silently
-    // resetting their accumulated workUnits to zero and dropping every
-    // share submitted right after until the client's next getWork refetch
-    // recreates the session from scratch.
-    session.lastSeenAt = Date.now();
-
-    if (typeof blockHex !== "string" || !/^[0-9a-fA-F]+$/.test(blockHex) || blockHex.length > 4_000_000) {
-      return { ok: false, reason: "invalid blockHex" };
-    }
-    if (!Number.isInteger(nonce) || nonce < 0 || nonce > 0xffff_ffff) {
-      return { ok: false, reason: "invalid nonce" };
-    }
-
-    let header: BlockHeader;
-    let block: Block;
+  private async pollPoolStatus(): Promise<void> {
+    if (!this.running || this.mode !== "pool") return;
     try {
-      const bytes = patchNonce(hexToBytes(blockHex), nonce);
-      block = deserializeBlock(bytes);
-      header = block.header;
+      this.poolStatus = await this.rest.getPoolStatus();
+      this.emit();
     } catch {
-      return { ok: false, reason: "could not deserialize submitted block" };
+      // Non-fatal: the round-contributors panel just goes stale until the
+      // next successful poll; mining itself doesn't depend on this.
     }
-
-    // Independently re-hash — never trust a client-supplied hash.
-    const hash: Hash = getBlockHash(header);
-
-    if (!hashMeetsTarget(hash, session.shareTarget)) {
-      return { ok: false, reason: "share does not meet this session's share target" };
-    }
-
-    this.creditShare(session, session.shareTarget);
-    const retargeted = this.maybeRetargetSession(session);
-
-    const networkTarget = compactToTarget(this.node.chain.nextDifficultyBits()) ?? MAX_TARGET;
-    if (!hashMeetsTarget(hash, networkTarget)) {
-      // Valid share, not (yet) a block — the common case.
-      return {
-        ok: true,
-        newShareTargetHex: retargeted ? session.shareTarget.toString(16).padStart(64, "0") : undefined,
-      };
-    }
-
-    // This share also clears the real network target: it's a block. The
-    // candidate's coinbase already pays the round's proportional split —
-    // fixed back at getWork, before this nonce was searched for (see
-    // getWork's doc comment) — so `block` can go straight to the node's
-    // normal acceptance path (which independently re-validates everything,
-    // including this coinbase's total against subsidy+fees — see utxo.ts).
-    const result = this.node.acceptLocalBlock(block);
-    const blockHashHex = getBlockHashHex(block.header);
-
-    if (result.ok) {
-      this.poolBlocksFound += 1;
-      this.round = new Map(); // fresh round for the next block
-      this.roundStartedAt = Date.now();
-    }
-
-    return {
-      ok: true,
-      wasBlock: true,
-      blockHash: blockHashHex,
-      blockAccepted: result.ok,
-      blockRejectReason: result.ok ? undefined : (result.reason ?? result.status),
-    };
   }
 
-  // ------------------------------------------------------------ accounting
+  private async fetchAndDispatchWork(): Promise<void> {
+    if (!this.running) return;
+    this.currentWorkVersion += 1;
+    const version = this.currentWorkVersion;
 
-  private creditShare(session: Session, shareTarget: bigint): void {
-    const existing = this.round.get(session.addressHex);
-    const workUnits = Number(MAX_TARGET / shareTarget) / WORK_UNIT_SCALE;
-    if (existing) {
-      existing.workUnits += workUnits;
-      existing.shareCount += 1;
-    } else {
-      this.round.set(session.addressHex, { addressHex: session.addressHex, workUnits, shareCount: 1 });
+    let work: GetWorkResponse | PoolGetWorkResponse;
+    try {
+      work = this.mode === "pool" ? await this.rest.getPoolWork(this.payoutAddress) : await this.rest.getWork(this.payoutAddress);
+    } catch (err) {
+      this.lastError = (err as Error).message;
+      this.emit();
+      // Retry shortly rather than giving up — the node may just be busy or
+      // briefly unreachable (e.g. a Render free-tier cold start).
+      this.refetchTimer = setTimeout(() => void this.fetchAndDispatchWork(), 5000);
+      return;
     }
-    session.recentShareTimestamps.push(Date.now());
-    if (session.recentShareTimestamps.length > 20) session.recentShareTimestamps.shift();
+    if (version !== this.currentWorkVersion || !this.running) return;
+
+    this.lastError = null;
+    this.currentTargetHex = work.target;
+    // "pool" mode responses include the (easier) shareTarget workers should
+    // actually search against; solo mode's GetWorkResponse has no such
+    // field, so fall back to the real network target.
+    const poolShareTarget = (work as Partial<PoolGetWorkResponse>).shareTarget;
+    this.currentShareTarget = typeof poolShareTarget === "string" ? poolShareTarget : work.target;
+    const searchTarget = this.currentShareTarget!;
+
+    const sliceSize = Math.floor(NONCE_SPACE / this.workerCount);
+    this.workers.forEach((worker, i) => {
+      const nonceStart = i * sliceSize;
+      const nonceEnd = i === this.workerCount - 1 ? NONCE_SPACE : nonceStart + sliceSize;
+      worker.postMessage({
+        type: "work",
+        header: {
+          version: work.header.version,
+          prevHashHex: work.header.prevHash,
+          merkleRootHex: work.header.merkleRoot,
+          timestamp: work.header.timestamp,
+          difficultyTarget: work.header.difficultyTarget,
+        },
+        targetHex: searchTarget,
+        nonceStart,
+        nonceEnd,
+        workerIndex: i,
+      });
+    });
+
+    this.currentBlockHex = work.blockHex;
+    this.emit();
   }
 
-  /** Per-session retarget so each tab's share frequency stays near
-   *  TARGET_SHARE_INTERVAL_MS regardless of its own hashrate — a fast
-   *  multi-core desktop and a slow phone browser both end up submitting
-   *  shares at a similar cadence, rather than the fast one flooding the
-   *  pool with requests or the slow one almost never submitting. Returns
-   *  true if the target actually changed. */
-  private maybeRetargetSession(session: Session): boolean {
-    const times = session.recentShareTimestamps;
-    if (times.length < RETARGET_MIN_SHARES) return false;
+  private async handleWorkerMessage(workerIndex: number, data: any): Promise<void> {
+    if (data.type === "hashrate") {
+      this.perWorkerHashrate[workerIndex] = data.hashesPerSecond;
+      if (data.hashMode === "wasm" || data.hashMode === "js") this.hashMode = data.hashMode;
+      this.emit();
+      return;
+    }
 
-    const span = times[times.length - 1]! - times[0]!;
-    const avgIntervalMs = span / (times.length - 1);
-    if (!Number.isFinite(avgIntervalMs) || avgIntervalMs <= 0) return false;
+    if (data.type === "exhausted") {
+      // This worker's slice is done with no luck. At real-world browser
+      // hashrates the full 2^32 space searched by all workers combined
+      // still vastly exceeds what's needed before the next block arrives
+      // from the network, so simply re-fetching fresh work (new timestamp,
+      // full nonce space again) is the right move rather than treating
+      // this as an error.
+      if (this.running) void this.fetchAndDispatchWork();
+      return;
+    }
 
-    let factor = avgIntervalMs / TARGET_SHARE_INTERVAL_MS;
-    factor = Math.max(1 / MAX_SHARE_RETARGET_FACTOR, Math.min(MAX_SHARE_RETARGET_FACTOR, factor));
-    if (Math.abs(factor - 1) < 0.15) return false; // don't thrash on small noise
+    if (data.type === "found") {
+      // Stop every worker immediately — no point burning battery/CPU on a
+      // candidate that's about to be superseded either way.
+      for (const w of this.workers) w.postMessage({ type: "stop" });
 
-    // Shares arriving faster than target (avgInterval < target -> factor<1)
-    // means the current target is too easy for this session's actual
-    // hashrate -> tighten it (smaller target = harder). Arriving slower ->
-    // loosen it (larger target = easier).
-    const networkTarget = compactToTarget(this.node.chain.nextDifficultyBits()) ?? MAX_TARGET;
-    const proposed = clampTarget(BigInt(Math.round(Number(session.shareTarget) * factor)));
-    session.shareTarget = proposed > networkTarget ? proposed : networkTarget;
-    session.recentShareTimestamps = [];
-    return true;
-  }
+      const currentBlockHex = this.currentBlockHex;
+      if (!currentBlockHex) return;
 
-  /**
-   * Replaces `draft`'s single-payee coinbase with one paying every
-   * contributor in the current round proportionally to their accumulated
-   * work, using @weave/core's multi-output coinbase support, and
-   * recomputes the header's merkle root to match — all *before* handing
-   * the candidate to a miner (see getWork's doc comment for why this can't
-   * happen after the fact, once a nonce has been searched for).
-   *
-   * `requesterPkh` covers the case where the round has no accumulated work
-   * yet (e.g. the first getWork of a fresh round): rather than build a
-   * zero-output coinbase, the requesting session is paid the full reward,
-   * same as buildProportionalOutputs's own empty-round fallback would if
-   * the round were merely thin rather than completely empty.
-   *
-   * Contributors whose share would round to below MIN_PAYOUT_SMALLEST_UNITS
-   * are simply omitted — their work still counts once more shares
-   * accumulate in future rounds, they just don't get a dust output this
-   * time (any smallest units freed up by omission stay unclaimed by
-   * design, same as how a solo miner's coinbase is allowed to pay *up to*
-   * — not necessarily exactly — subsidy+fees; see utxo.ts's coinbase
-   * check).
-   */
-  private buildRoundCoinbase(
-    draft: Block,
-    height: number,
-    totalFees: bigint,
-    requesterPkh: Uint8Array,
-  ): Block {
-    const totalReward = BigInt(getBlockRewardSmallestUnits(height)) + totalFees;
+      if (this.mode === "pool") {
+        try {
+          const result = await this.rest.submitShare(this.payoutAddress, currentBlockHex, data.nonce);
+          if (!result.ok) {
+            this.lastResult = { accepted: false, reason: result.reason };
+            // The server-side session backing this candidate expired
+            // (idle-pruned) between getWork and this submission — the share
+            // itself is unrecoverable (it was built against that session's
+            // now-gone share target/round state), but silently moving on
+            // would let this repeat indefinitely on a long-idle tab,
+            // quietly dropping share after share. Force a fresh getWork now
+            // rather than waiting for the normal post-submit refetch below,
+            // so a new session — and fresh accumulated work — starts
+            // immediately instead of after another full nonce-range attempt.
+            if (result.reason?.includes("no active session")) {
+              this.lastError = "Mining session expired and was refreshed — the last share couldn't be credited.";
+            }
+          } else if (result.wasBlock) {
+            this.lastResult = { accepted: !!result.blockAccepted, hash: result.blockHash, reason: result.blockRejectReason, wasShare: false };
+          } else {
+            // An ordinary accepted share: credited work, not (yet) a block.
+            this.blocksFound += 1; // "shares found" in pool mode — see MinerStatus doc comment
+            this.lastResult = { accepted: true, wasShare: true };
+          }
+          void this.pollPoolStatus();
+          // A share just changed this round's accumulated work, but every
+          // OTHER worker in this session (and every other session) is still
+          // searching a candidate whose coinbase was frozen at its own last
+          // getWork call — see mining-pool.ts's getWork doc comment: the
+          // payout split can't be edited after a nonce search starts, only
+          // baked in before one begins. So the payout a block actually pays
+          // is only ever as fresh as the last getWork before it was found.
+          // Re-fetching work after every accepted share (not just after
+          // this worker's own find, which fetchAndDispatchWork already
+          // does below) keeps that staleness window small instead of
+          // letting a session mine one candidate — with a stale, possibly
+          // single-payee round snapshot — across many shares.
+        } catch (err) {
+          this.lastResult = { accepted: false, reason: (err as Error).message };
+        }
+      } else {
+        const blockWithNonce = patchNonceInBlockHex(currentBlockHex, data.nonce);
+        try {
+          const result = await this.rest.submitBlock(blockWithNonce);
+          this.lastResult = { accepted: result.ok, hash: result.hash, reason: result.reason };
+          if (result.ok) this.blocksFound += 1;
+        } catch (err) {
+          this.lastResult = { accepted: false, reason: (err as Error).message };
+        }
+      }
+      this.emit();
 
-    const totalWork = [...this.round.values()].reduce((s, c) => s + c.workUnits, 0);
-    const outputs =
-      totalWork > 0
-        ? buildProportionalOutputs(this.round, totalWork, totalReward)
-        : [{ value: totalReward, lockingScript: createLockingScript(requesterPkh) }];
-
-    const coinbase = createCoinbaseTransaction(height, outputs, coinbaseExtraFromCandidate(draft));
-    const transactions = [coinbase, ...draft.transactions.slice(1)];
-    const header: BlockHeader = {
-      ...draft.header,
-      merkleRoot: computeMerkleRootOfTransactions(transactions),
-    };
-    return { header, transactions };
-  }
-
-  // ------------------------------------------------------------- read-only
-
-  status(): PoolStatus {
-    const totalWorkUnits = [...this.round.values()].reduce((s, c) => s + c.workUnits, 0);
-    return {
-      active: this.active,
-      round: {
-        contributors: [...this.round.values()]
-          .sort((a, b) => b.workUnits - a.workUnits)
-          .map((c) => ({
-            addressHex: c.addressHex,
-            workUnits: c.workUnits,
-            shareCount: c.shareCount,
-            sharePct: totalWorkUnits > 0 ? (c.workUnits / totalWorkUnits) * 100 : 0,
-          })),
-        totalWorkUnits,
-        startedAt: this.roundStartedAt,
-      },
-      poolBlocksFound: this.poolBlocksFound,
-      sessionCount: this.sessions.size,
-    };
-  }
-
-  /** Prunes sessions idle for longer than `maxIdleMs` — call periodically
-   *  (see api/rest.ts's pool route registration) so a long-running node
-   *  doesn't accumulate unbounded session state from tabs that navigated
-   *  away without an explicit "stop mining". */
-  pruneIdleSessions(maxIdleMs: number): void {
-    const cutoff = Date.now() - maxIdleMs;
-    for (const [k, s] of this.sessions) {
-      if (s.lastSeenAt < cutoff) this.sessions.delete(k);
+      // Whether accepted or not, the candidate is spent — get fresh work.
+      if (this.running) void this.fetchAndDispatchWork();
     }
   }
 }
 
-// --------------------------------------------------------------- utilities
+/**
+ * The node hands out `blockHex` with nonce=0 in the header (see
+ * getWork.ts: it serializes the freshly-assembled candidate before any
+ * mining happens). The header's nonce is the last 4 bytes of the 80-byte
+ * header, which is itself the first 80 bytes of the block — so patching
+ * it in place is a fixed-offset byte write, no need to deserialize and
+ * re-serialize the whole block (with its potentially many transactions)
+ * just to change one field. (Pool mode doesn't need this: submitShare
+ * takes the blockHex and nonce separately and patches server-side.)
+ */
+function patchNonceInBlockHex(blockHex: string, nonce: number): string {
+  const bytes = new Uint8Array(blockHex.length / 2);
+  for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(blockHex.substr(i * 2, 2), 16);
 
-function clampTarget(t: bigint): bigint {
-  if (t < 1n) return 1n;
-  if (t > MAX_TARGET) return MAX_TARGET;
-  return t;
-}
+  const NONCE_OFFSET = 4 + 32 + 32 + 4 + 4; // version + prevHash + merkleRoot + timestamp + difficultyTarget
+  const view = new DataView(bytes.buffer);
+  view.setUint32(NONCE_OFFSET, nonce, true); // little-endian, matches block.ts's writeHeader
 
-const NONCE_OFFSET = 4 + 32 + 32 + 4 + 4;
-
-/** Patches the 4-byte little-endian nonce into an 80-byte-header-prefixed
- *  serialized block, same fixed-offset trick the wallet's minerPool.ts
- *  uses client-side — done again here server-side because a share
- *  submission carries the *candidate's* blockHex (nonce unset) plus the
- *  winning nonce separately, mirroring the client's own message shape
- *  rather than asking it to re-serialize the whole block just to change
- *  one field. */
-function patchNonce(bytes: Uint8Array, nonce: number): Uint8Array {
-  const out = bytes.slice();
-  const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
-  view.setUint32(NONCE_OFFSET, nonce, true);
-  return out;
-}
-
-function buildProportionalOutputs(
-  round: Map<string, RoundContributor>,
-  totalWork: number,
-  totalReward: bigint,
-): { value: bigint; lockingScript: Uint8Array }[] {
-  const outputs: { value: bigint; lockingScript: Uint8Array }[] = [];
-  let distributed = 0n;
-  const contributors = [...round.values()];
-  const totalWorkScaled = BigInt(Math.round(totalWork * WORK_UNIT_SCALE));
-  for (let i = 0; i < contributors.length; i++) {
-    const c = contributors[i]!;
-    const isLast = i === contributors.length - 1;
-    // Last contributor gets the remainder rather than its own rounded
-    // share, so integer-division rounding never leaves smallest units
-    // unaccounted for while still respecting totalReward as a hard cap.
-    const share = isLast
-      ? totalReward - distributed
-      : (totalReward * BigInt(Math.round(c.workUnits * WORK_UNIT_SCALE))) / totalWorkScaled;
-    distributed += share;
-    if (share < MIN_PAYOUT_SMALLEST_UNITS) continue; // see rebuildWithRoundCoinbase's doc comment
-    outputs.push({ value: share, lockingScript: createLockingScript(hexToBytes(c.addressHex)) });
-  }
-  // Extremely unlikely (only if every contributor was below the dust
-  // threshold), but never ship a coinbase with zero outputs: fall back to
-  // paying the top contributor the full reward.
-  if (outputs.length === 0 && contributors.length > 0) {
-    const top = [...contributors].sort((a, b) => b.workUnits - a.workUnits)[0]!;
-    outputs.push({ value: totalReward, lockingScript: createLockingScript(hexToBytes(top.addressHex)) });
-  }
-  return outputs;
-}
-
-function coinbaseExtraFromCandidate(block: Block): Uint8Array | undefined {
-  // Preserve the candidate's extranonce bytes (everything after the
-  // 4-byte height prefix — see @weave/core transaction.ts's
-  // getCoinbaseHeight/createCoinbaseTransaction) so the rebuilt coinbase's
-  // script is still unique per candidate even though its outputs changed;
-  // createCoinbaseTransaction re-derives the height prefix itself, so only
-  // the portion after it needs to be passed through here.
-  const script = block.transactions[0]!.inputs[0]!.unlockingScript;
-  return script.length > 4 ? script.slice(4) : undefined;
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }
