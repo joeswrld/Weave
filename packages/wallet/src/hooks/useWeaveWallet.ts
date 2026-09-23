@@ -126,9 +126,20 @@ export function useWeaveWallet(nodeUrl: string) {
   const send = useCallback(
     async (toAddress: string, amountSmallestUnits: bigint) => {
       if (!wallet) throw new Error("Wallet is locked.");
+      // Re-fetch UTXOs right before building rather than trusting the
+      // `utxos` state snapshot: that state is only refreshed on a WS
+      // block/tx/reorg event or after a previous send, so it can be
+      // stale by the time this runs (e.g. two sends close together, or
+      // an outpoint that was already spent since the last refresh). Using
+      // a stale list lets the builder pick an already-spent outpoint,
+      // which the node then rejects with "outpoint ... does not exist or
+      // is already spent" — confusing for something that's really just a
+      // timing issue on the wallet's side, not an actual double-spend.
+      const freshUtxos = await restRef.current.listUnspent(wallet.address);
+      setUtxos(freshUtxos);
       const built = buildAndSignTransaction({
         wallet,
-        utxos,
+        utxos: freshUtxos,
         toAddress,
         amountSmallestUnits,
       });
@@ -136,7 +147,7 @@ export function useWeaveWallet(nodeUrl: string) {
       await refreshBalanceAndUtxos(wallet.address);
       return { txid: result.txid, fee: built.fee };
     },
-    [wallet, utxos, refreshBalanceAndUtxos],
+    [wallet, refreshBalanceAndUtxos],
   );
 
   const startMining = useCallback(() => {
