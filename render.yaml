@@ -2,7 +2,11 @@ services:
   - type: web
     name: weave-node
     runtime: docker
-    plan: free
+    # Persistent disks (below) are a paid-plan feature — Render silently
+    # can't attach one to a free-plan service, so /data was ephemeral and
+    # every redeploy reset the chain to a fresh genesis. `starter` is the
+    # cheapest plan that actually gets the disk mounted.
+    plan: starter
     # Build context is the monorepo root — packages/node/Dockerfile's
     # `COPY . .` needs every workspace package (core, crypto, protocol),
     # not just packages/node, so the context can't be scoped down to that
