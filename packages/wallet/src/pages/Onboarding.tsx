@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { WeaveCoinIcon } from "../components/WeaveCoinIcon";
 
 interface OnboardingProps {
   onCreate: () => Promise<void>;
@@ -45,7 +46,7 @@ export function Onboarding({ onCreate, onImport }: OnboardingProps) {
     return (
       <div className="onboarding">
         <div className="onboarding-mark">
-          <WeaveMark />
+          <WeaveCoinIcon size={56} />
         </div>
         <h1>Restore a wallet</h1>
         <p>Paste the private key you backed up earlier.</p>
@@ -76,7 +77,7 @@ export function Onboarding({ onCreate, onImport }: OnboardingProps) {
   return (
     <div className="onboarding">
       <div className="onboarding-mark">
-        <WeaveMark />
+        <WeaveCoinIcon size={56} />
       </div>
       <h1>Welcome to Weave</h1>
       <p>
@@ -97,19 +98,5 @@ export function Onboarding({ onCreate, onImport }: OnboardingProps) {
         losing it means losing access to any funds it holds.
       </p>
     </div>
-  );
-}
-
-function WeaveMark() {
-  return (
-    <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
-      <path
-        d="M6 10 L12 22 L16 12 L20 22 L26 10"
-        stroke="#5EE6C4"
-        strokeWidth="2.4"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-    </svg>
   );
 }
