@@ -210,6 +210,11 @@ button {
   gap: 8px;
 }
 
+.balance-amount .coin-icon {
+  flex-shrink: 0;
+  align-self: center;
+}
+
 .balance-amount .ticker {
   font-family: var(--font-ui);
   font-size: 0.4em;
