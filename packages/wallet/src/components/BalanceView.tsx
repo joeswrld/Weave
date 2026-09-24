@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { formatWve, shortenAddress } from "../lib/format";
+import { WeaveCoinIcon } from "./WeaveCoinIcon";
 
 interface BalanceViewProps {
   address: string;
@@ -34,6 +35,7 @@ export function BalanceView({ address, confirmed, immature, utxoCount, onReceive
     <div className="card">
       <p className="card-label">Balance</p>
       <div className="balance-amount">
+        <WeaveCoinIcon size={28} className="coin-icon" />
         {confirmed === null ? "—" : formatWve(confirmed)}
         <span className="ticker">WVE</span>
       </div>
